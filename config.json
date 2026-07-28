@@ -28,7 +28,7 @@
       {
         "name": "multitran",
         "source_type": "html",
-        "url_template": "https://www.multitran.com/m.exe?s={word}&l1=2&l2=9",
+        "url_template": "https://www.multitran.com/m.exe?s={word}&l1=2&l2=1",
         "enabled": true,
         "field_map": {
           "translations": [
@@ -51,20 +51,20 @@
         "enabled": true,
         "field_map": {
           "translations": [
-            "<a[^>]*class=\"[^\"]*translation[^\"]*\"[^>]*>\\s*<span[^>]*>([^<]+)</span>",
+            "<div[^>]*id=\"translations-content\"[^>]*>.*?<a[^>]*class=\"[^\"]*translation[^\"]*\"[^>]*>\\s*<span[^>]*>([^<]+)</span>",
             "<div[^>]*id=\"translations-content\"[^>]*>.*?<a[^>]*>([^<]+)</a>"
           ],
           "example_pairs_source": [
-            "<div[^>]*class=\"[^\"]*src[^\"]* ltr\"[^>]*>\\s*<span[^>]*class=\"text\"[^>]*>(.*?)</span>"
+            "<div[^>]*class=\"src ltr\"[^>]*>\\s*<span[^>]*class=\"text\"[^>]*>(.*?)</span>\\s*</div>"
           ],
           "example_pairs_target": [
-            "<div[^>]*class=\"[^\"]*trg[^\"]* ltr\"[^>]*>\\s*<span[^>]*class=\"text\"[^>]*>(.*?)</span>"
+            "<div[^>]*class=\"trg ltr\"[^>]*>\\s*(?:<span[^>]*class=\"icon[^\"]*\"[^>]*>\\s*</span>\\s*)?<span[^>]*class=\"text\"[^>]*>(.*?)</span>\\s*</div>"
           ]
         },
         "timeout_seconds": 20,
         "max_retries": 2,
         "request_delay_seconds": 1.5,
-        "note": "SPA寄りのサイトのためSSR HTMLに翻訳データが含まれない場合がある。動作結果を見てfield_mapを調整、または __NEXT_DATA__ 等の埋め込みJSON抽出方式への切り替えが必要になる可能性あり。"
+        "note": "SPA寄りのサイトのためSSR HTMLに翻訳データが含まれない場合がある。以前は「Translation」というUIボタンのラベルを誤って最初の訳語として拾っていたため、必ず#translations-content内に限定するよう修正した。また .trg.ltr 内では <span class=\"text\"> の前に <span class=\"icon jump-right\"></span> という空spanが先行するため、直後の最初の</span>にマッチしてしまい example_pairs_target が常に空になっていた。この空iconスパンを許容してスキップするよう修正。動作結果を見てfield_mapを再調整、または __NEXT_DATA__ 等の埋め込みJSON抽出方式への切り替えが必要になる可能性あり。"
       }
     ],
     "user_agent": "Mozilla/5.0 (compatible; VocabToolBot/1.0; +https://example.com/bot-info)"
