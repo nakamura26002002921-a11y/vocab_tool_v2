@@ -23,12 +23,21 @@ scraping.py
   ソースごとの抽出結果をまとめた dict を返す。
 - 下流（summarize.py）との互換性のため、戻り値の形は常に
   {"status": ..., "extracted": {field_name: [text, ...]}} を維持する。
+
+--- ブロック対策について ---
+curl_cffi の impersonate="chrome120" でTLS/HTTP2フィンガープリントをChromeに
+似せているが、これはヘッダー（特にUser-Agent）が実際のChromeと矛盾していないことが
+前提。config.json の user_agent は実在のChrome UA文字列を使うこと（"...Bot..."の
+ような自己申告UAは、TLSはChromeなのにUAはbotという矛盾したシグナルになり、
+かえって検知されやすくなる）。また、Accept/Accept-Encoding/Refererなど実ブラウザが
+送る基本ヘッダーも付与し、403/429は404と区別してバックオフ付きで再試行する。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import sys
 import time
@@ -59,12 +68,40 @@ def _build_api_url(api_url_template: str) -> str:
     return api_url_template.rstrip("/")
 
 
-def _fetch_html_page(url: str, user_agent: str, timeout: int, max_retries: int) -> str:
-    """通常のHTMLページを取得する（HTML方式ソース用）。"""
+def _referer_for(url: str) -> str:
+    """URLのオリジン（スキーム+ホスト）をRefererとして使う。
+    直接ページを叩くbotらしさを減らすため、実ブラウザのように「サイトのトップから
+    辿ってきた」体裁のRefererを付与する。"""
+    m = re.match(r"^(https?://[^/]+)", url)
+    return (m.group(1) + "/") if m else url
+
+
+def _browser_headers(user_agent: str, url: str, extra: Optional[dict] = None) -> dict:
+    """実ブラウザが送る基本ヘッダー一式を組み立てる。
+    curl_cffiのimpersonateはTLS/HTTP2フィンガープリント側は模倣してくれるが、
+    ヘッダーは呼び出し側で指定した内容がそのまま使われるため、ここでUser-Agentと
+    矛盾しない一式を揃えておく。"""
     headers = {
         "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "ru,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": _referer_for(url),
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _is_blocking_status(status_code: int) -> bool:
+    return status_code in (403, 429, 503)
+
+
+def _fetch_html_page(url: str, user_agent: str, timeout: int, max_retries: int) -> str:
+    """通常のHTMLページを取得する（HTML方式ソース用）。"""
+    headers = _browser_headers(user_agent, url)
     last_exc: Optional[Exception] = None
 
     for attempt in range(1, max_retries + 1):
@@ -72,10 +109,23 @@ def _fetch_html_page(url: str, user_agent: str, timeout: int, max_retries: int) 
             resp = requests.get(url, headers=headers, timeout=timeout, impersonate="chrome120")
             if resp.status_code == 404:
                 raise ScrapingError(f"404 Not Found: {url}")
+            if _is_blocking_status(resp.status_code):
+                raise ScrapingError(f"{resp.status_code} ブロックされた可能性があります: {url}")
             resp.raise_for_status()
             resp.encoding = resp.apparent_encoding or "utf-8"
             return resp.text
-        except ScrapingError:
+        except ScrapingError as e:
+            last_exc = e
+            # 403/429/503はサーバー側のブロック/レート制限の可能性が高いため、
+            # 単純な404と違い長めのバックオフ（+ジッター）を入れてから再試行する
+            if any(code in str(e) for code in ("403", "429", "503")) and attempt < max_retries:
+                backoff = 4.0 * attempt + random.uniform(0, 2.0)
+                logger.warning(
+                    "scraping: blocked (attempt %d/%d) url=%s error=%s — backing off %.1fs",
+                    attempt, max_retries, url, e, backoff,
+                )
+                time.sleep(backoff)
+                continue
             raise
         except Exception as e:  # noqa: BLE001
             last_exc = e
@@ -84,14 +134,14 @@ def _fetch_html_page(url: str, user_agent: str, timeout: int, max_retries: int) 
                 attempt, max_retries, url, e,
             )
             if attempt < max_retries:
-                time.sleep(1.5 * attempt)
+                time.sleep(1.5 * attempt + random.uniform(0, 1.0))
 
     raise ScrapingError(f"Failed to fetch {url}: {last_exc}")
 
 
 def _fetch_wikitext(api_url: str, page: str, user_agent: str, timeout: int, max_retries: int) -> str:
     """action=parse&prop=wikitext を叩いてページの生wikitextを返す。"""
-    headers = {"User-Agent": user_agent}
+    headers = _browser_headers(user_agent, api_url, extra={"Accept": "application/json"})
     params = {
         "action": "parse",
         "page": page,
@@ -104,7 +154,11 @@ def _fetch_wikitext(api_url: str, page: str, user_agent: str, timeout: int, max_
 
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.get(api_url, params=params, headers=headers, timeout=timeout)
+            resp = requests.get(
+                api_url, params=params, headers=headers, timeout=timeout, impersonate="chrome120"
+            )
+            if _is_blocking_status(resp.status_code):
+                raise ScrapingError(f"{resp.status_code} ブロックされた可能性があります: {api_url}?page={page}")
             resp.raise_for_status()
             data = resp.json()
 
@@ -120,7 +174,16 @@ def _fetch_wikitext(api_url: str, page: str, user_agent: str, timeout: int, max_
             if wikitext is None:
                 raise ScrapingError(f"Unexpected API response shape (no parse.wikitext): {api_url}?page={page}")
             return wikitext
-        except ScrapingError:
+        except ScrapingError as e:
+            last_exc = e
+            if any(code in str(e) for code in ("403", "429", "503")) and attempt < max_retries:
+                backoff = 4.0 * attempt + random.uniform(0, 2.0)
+                logger.warning(
+                    "scraping: blocked (attempt %d/%d) api_url=%s page=%s error=%s — backing off %.1fs",
+                    attempt, max_retries, api_url, page, e, backoff,
+                )
+                time.sleep(backoff)
+                continue
             raise
         except Exception as e:  # noqa: BLE001
             last_exc = e
@@ -129,7 +192,7 @@ def _fetch_wikitext(api_url: str, page: str, user_agent: str, timeout: int, max_
                 attempt, max_retries, api_url, page, e,
             )
             if attempt < max_retries:
-                time.sleep(1.5 * attempt)
+                time.sleep(1.5 * attempt + random.uniform(0, 1.0))
 
     raise ScrapingError(f"Failed to fetch {api_url}?page={page}: {last_exc}")
 
@@ -623,9 +686,11 @@ def scrape_word(word: str, config: dict, force_refresh: bool = False) -> dict:
             _save_to_cache(db_path, word, result)
         results[source["name"]] = {"status": result["status"], "extracted": result["extracted"]}
 
+        # request_delay_seconds を基準に、毎回同じ間隔にならないようジッターを加える
+        # （規則正しすぎるリクエスト間隔もbot検知シグナルの一つになりうるため）
         delay = source.get("request_delay_seconds", 1.0)
         if delay:
-            time.sleep(delay)
+            time.sleep(delay + random.uniform(0, delay * 0.5))
 
     return {"word": word, "sources": results}
 
