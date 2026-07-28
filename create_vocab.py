@@ -90,11 +90,20 @@ def _normalize_joined(s: str) -> str:
     return ITEM_SEP.join(t.strip() for t in s.split(ITEM_SEP) if t.strip())
 
 
+# Wiktionaryが「該当データなし/不明」を表すために使うプレースホルダー記号。
+# これらのみで構成される項目は情報を持たないため、_join_items で除去する。
+_PLACEHOLDER_TOKENS = {"—", "–", "-", "?", "#", "??", "###"}
+
+
 def _join_items(items) -> str:
-    """extracted の値（文字列のリスト）を、空要素を除いて " / " で結合する。"""
+    """extracted の値（文字列のリスト）を、空要素・プレースホルダーのみの要素を除いて
+    " / " で結合する。"""
     if not items:
         return ""
-    return ITEM_SEP.join(t.strip() for t in items if isinstance(t, str) and t.strip())
+    return ITEM_SEP.join(
+        t.strip() for t in items
+        if isinstance(t, str) and t.strip() and t.strip() not in _PLACEHOLDER_TOKENS
+    )
 
 
 def get_ru_source_data(db_path: str, word: str) -> dict | None:
@@ -147,8 +156,10 @@ SYSTEM_PROMPT = (
     "(2) write, in Japanese, a concise dictionary card based on the Russian material: "
     "the meaning and a memory tip / mnemonic / common collocations; "
     "(3) instead of translating the existing example sentences, WRITE YOUR OWN new, "
-    "natural, contemporary Russian example sentences — one per distinct meaning sense "
-    "you listed in Meaning_JA — plus their Japanese translations. Each generated example "
+    "natural, contemporary Russian example sentences — at most two, covering the most "
+    "representative meaning sense(s) from Meaning_JA (if the word is polysemous, pick "
+    "the one or two most important/common senses rather than covering every sense) — "
+    "plus their Japanese translations. Each generated example "
     "must clearly illustrate one of the meaning senses you identified; do not invent a "
     "meaning or usage that is not supported by the given Russian material (definitions, "
     "existing examples, or collocations). Prefer everyday, natural phrasing a modern "
@@ -201,10 +212,11 @@ Reverso Context: {reverso_translations_en}
 上記のロシア語情報を根拠にして、日本語の単語帳カードを作成してください。
 イディオムや多義語のニュアンスに注意し、直訳ではなく意図された意味を日本語で表現してください。
 文法情報は「文法情報」欄の自然文から読み取り、記載が無い項目は空文字にしてください。
-例文は「既存の例文」をそのまま訳すのではなく、Meaning_JAで挙げた意味それぞれに対応する
-自然で現代的な新しいロシア語例文をあなた自身が作成し、その日本語訳も付けてください
-（意味を勝手に増やして例文を作らないこと。既存の例文にある用法・コロケーションの範囲内で
-自然な文を作ること）。
+例文は「既存の例文」をそのまま訳すのではなく、Meaning_JAで挙げた意味の中から代表的な
+意味を最大2つ選び、それぞれに対応する自然で現代的な新しいロシア語例文（合計最大2文）を
+あなた自身が作成し、その日本語訳も付けてください（多義語のすべての意味に例文をつける
+必要はありません。意味を勝手に増やして例文を作らないこと。既存の例文にある用法・
+コロケーションの範囲内で自然な文を作ること）。
 
 以下のJSON形式で出力してください（他のテキストは一切含めないこと）:
 {{
@@ -214,7 +226,7 @@ Reverso Context: {reverso_translations_en}
   "PairedVerb": "完了体/不完了体のペア動詞（動詞の場合のみ、ロシア語表記。無ければ空文字）",
   "Meaning_JA": "日本語での意味の解説。複数の意味がある場合は「 / 」区切りで並べる。空項目・末尾の区切りは禁止",
   "MemoryTip_JA": "語源・イメージ・語呂合わせなどの覚え方のコツと、代表的なコロケーション（よく使われる語の組み合わせ）を日本語で簡潔に説明する",
-  "Examples_RU": "Meaning_JAの各意味に対応する、あなたが新規作成した自然なロシア語例文。意味の数と同じ数、同じ順序で「 / 」区切りで並べる。空項目・末尾の区切りは禁止",
+  "Examples_RU": "代表的な意味（最大2つ）についてあなたが新規作成した自然なロシア語例文（最大2文）。「 / 」区切りで並べる。空項目・末尾の区切りは禁止",
   "Examples_JA": "Examples_RUと同じ数・同じ順序の日本語訳を「 / 」区切りで並べる。空項目・末尾の区切りは禁止"
 }}
 """
@@ -380,6 +392,12 @@ def call_llm_api(word: str, ru: dict, provider_cfg: dict) -> tuple[dict, str]:
             # プロンプトの指示（空項目・末尾区切り禁止）だけに頼らず、決定的に正規化する
             for key in ("Meaning_JA", "Examples_RU", "Examples_JA"):
                 parsed[key] = _normalize_joined(parsed[key])
+
+            # 例文は最大2件までという指示も、プロンプト遵守だけに頼らず決定的に切り詰める
+            MAX_EXAMPLES = 2
+            for key in ("Examples_RU", "Examples_JA"):
+                items = [t for t in parsed[key].split(ITEM_SEP) if t.strip()]
+                parsed[key] = ITEM_SEP.join(items[:MAX_EXAMPLES])
 
             # 例文は今回LLMが新規生成するため、比較対象はスクレイピング原文ではなく
             # 生成したExamples_RUとExamples_JA同士。対応関係が崩れている（訳の欠落・混入）
