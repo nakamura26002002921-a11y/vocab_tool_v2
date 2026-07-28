@@ -112,7 +112,6 @@ def _fetch_html_page(url: str, user_agent: str, timeout: int, max_retries: int) 
             if _is_blocking_status(resp.status_code):
                 raise ScrapingError(f"{resp.status_code} ブロックされた可能性があります: {url}")
             resp.raise_for_status()
-            resp.encoding = resp.apparent_encoding or "utf-8"
             return resp.text
         except ScrapingError as e:
             last_exc = e
