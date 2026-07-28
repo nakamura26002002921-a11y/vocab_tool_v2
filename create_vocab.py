@@ -52,7 +52,7 @@ ITEM_SEP = " / "
 CSV_HEADER = [
     "Word", "Accent", "POS", "Gender", "Aspect", "PairedVerb",
     "Meaning_JA", "MemoryTip_JA",
-    "Examples_RU", "Examples_JA",
+    "Examples_RU", "Examples_JA", "Examples_RU_Source",
     "Synonyms_RU", "Antonyms_RU", "RelatedWords_RU",
 ]
 
@@ -80,6 +80,14 @@ def _get_raw_extracted(db_path: str, word: str, source_url_substr: str) -> dict 
         return json.loads(row["extracted"])
     except (json.JSONDecodeError, TypeError):
         return None
+
+
+def _normalize_joined(s: str) -> str:
+    """" / "区切り文字列から、空項目・前後の余分な空白を除去して再結合する。
+    プロンプト遵守（空項目/末尾区切り禁止の指示）だけに頼らず、決定的に保証するためのフェイルセーフ。"""
+    if not isinstance(s, str):
+        return s
+    return ITEM_SEP.join(t.strip() for t in s.split(ITEM_SEP) if t.strip())
 
 
 def _join_items(items) -> str:
@@ -120,27 +128,40 @@ def get_ru_source_data(db_path: str, word: str) -> dict | None:
 # LLM用プロンプト
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "You are an expert Russian-language teacher creating a vocabulary card for a "
-    "Japanese learner of Russian. You will be given raw data scraped from Russian "
-    "Wiktionary for a single word: a paragraph describing its grammatical properties "
-    "(part of speech, gender, aspect, aspectual pair, etc.), its natural, hand-picked "
-    "meaning definitions, example sentences, and lists of synonyms/antonyms/related "
-    "words. This Russian material is reliable and idiomatic, though the grammar "
-    "paragraph is unstructured free text that you must parse yourself. Optionally you "
-    "may also receive short English translations from other dictionaries as extra "
+    "You are an expert Russian-language teacher creating a vocabulary flashcard for a "
+    "Japanese learner of Russian, to be studied in a spaced-repetition app. You will be "
+    "given raw data scraped from Russian Wiktionary for a single word: a paragraph "
+    "describing its grammatical properties (part of speech, gender, aspect, aspectual "
+    "pair, etc.), its natural, hand-picked meaning definitions, some existing example "
+    "sentences (these are real citations from a Russian corpus — reliable but often in "
+    "a literary/formal register), and lists of synonyms/antonyms/related words. This "
+    "Russian material is reliable and idiomatic, though the grammar paragraph is "
+    "unstructured free text that you must parse yourself, and the existing example "
+    "sentences may be sparse, missing, or stylistically dated for a learner. Optionally "
+    "you may also receive short English translations from other dictionaries as extra "
     "reference (these can be noisy or incomplete; trust the Russian material first). "
-    "Your job is two-fold: "
+    "Your job is three-fold: "
     "(1) parse the grammar paragraph to identify part of speech, gender (nouns only), "
     "aspect (verbs only), and the aspectual pair verb (verbs only) — leave a field "
     "empty if it does not apply or is not stated; "
     "(2) write, in Japanese, a concise dictionary card based on the Russian material: "
-    "the meaning, a memory tip / mnemonic / common collocations, and Japanese "
-    "translations of the given example sentences. "
+    "the meaning and a memory tip / mnemonic / common collocations; "
+    "(3) instead of translating the existing example sentences, WRITE YOUR OWN new, "
+    "natural, contemporary Russian example sentences — one per distinct meaning sense "
+    "you listed in Meaning_JA — plus their Japanese translations. Each generated example "
+    "must clearly illustrate one of the meaning senses you identified; do not invent a "
+    "meaning or usage that is not supported by the given Russian material (definitions, "
+    "existing examples, or collocations). Prefer everyday, natural phrasing a modern "
+    "native speaker would actually say over rare vocabulary or ornate literary "
+    "constructions, while staying grammatically correct and idiomatic. You may use the "
+    "existing example sentences as inspiration/reference but should not reuse them "
+    "verbatim. "
     "Pay close attention to idioms, colloquial phrasing, and polysemous meanings so "
     "your Japanese reflects the true intended meaning rather than a literal "
     "word-for-word translation. Do not invent grammatical facts or meanings not "
     "supported by the given Russian material. Output valid JSON only, with no "
-    "markdown code fences."
+    "markdown code fences. Never include empty items or trailing ' / ' separators in "
+    "any of the ' / '-joined string fields."
 )
 
 USER_PROMPT_TEMPLATE = """\
@@ -153,7 +174,8 @@ USER_PROMPT_TEMPLATE = """\
 # ロシア語の意味定義（Wiktionaryより）
 {meanings_ru}
 
-# ロシア語の例文（Wiktionaryより、自然な文なので信頼できる。この順序・数を厳守して日本語訳を作ること）
+# 既存の例文（Wiktionaryより、参考情報。実在するコーパスからの引用で内容は信頼できるが、
+# やや硬い/古い文体のことがある。そのまま訳すのではなく、意味の把握と新しい例文作成の参考にすること）
 {examples_ru}
 
 # 既存のコロケーション（あれば）
@@ -179,6 +201,10 @@ Reverso Context: {reverso_translations_en}
 上記のロシア語情報を根拠にして、日本語の単語帳カードを作成してください。
 イディオムや多義語のニュアンスに注意し、直訳ではなく意図された意味を日本語で表現してください。
 文法情報は「文法情報」欄の自然文から読み取り、記載が無い項目は空文字にしてください。
+例文は「既存の例文」をそのまま訳すのではなく、Meaning_JAで挙げた意味それぞれに対応する
+自然で現代的な新しいロシア語例文をあなた自身が作成し、その日本語訳も付けてください
+（意味を勝手に増やして例文を作らないこと。既存の例文にある用法・コロケーションの範囲内で
+自然な文を作ること）。
 
 以下のJSON形式で出力してください（他のテキストは一切含めないこと）:
 {{
@@ -186,13 +212,14 @@ Reverso Context: {reverso_translations_en}
   "Gender": "性（名詞の場合のみ。例: 男性, 女性, 中性。該当しなければ空文字）",
   "Aspect": "体（動詞の場合のみ。例: 完了体, 不完了体。該当しなければ空文字）",
   "PairedVerb": "完了体/不完了体のペア動詞（動詞の場合のみ、ロシア語表記。無ければ空文字）",
-  "Meaning_JA": "日本語での意味の解説。複数の意味がある場合は「 / 」区切りで並べる",
+  "Meaning_JA": "日本語での意味の解説。複数の意味がある場合は「 / 」区切りで並べる。空項目・末尾の区切りは禁止",
   "MemoryTip_JA": "語源・イメージ・語呂合わせなどの覚え方のコツと、代表的なコロケーション（よく使われる語の組み合わせ）を日本語で簡潔に説明する",
-  "Examples_JA": "上のロシア語例文を1文ずつ日本語に訳したもの。ロシア語例文と同じ数、同じ順序で「 / 」区切りで並べる"
+  "Examples_RU": "Meaning_JAの各意味に対応する、あなたが新規作成した自然なロシア語例文。意味の数と同じ数、同じ順序で「 / 」区切りで並べる。空項目・末尾の区切りは禁止",
+  "Examples_JA": "Examples_RUと同じ数・同じ順序の日本語訳を「 / 」区切りで並べる。空項目・末尾の区切りは禁止"
 }}
 """
 
-_REQUIRED_KEYS = ("POS", "Gender", "Aspect", "PairedVerb", "Meaning_JA", "MemoryTip_JA", "Examples_JA")
+_REQUIRED_KEYS = ("POS", "Gender", "Aspect", "PairedVerb", "Meaning_JA", "MemoryTip_JA", "Examples_RU", "Examples_JA")
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +244,7 @@ def ensure_vocab_final_table(db_path):
                 memory_tip_ja    TEXT,
                 examples_ru      TEXT,
                 examples_ja      TEXT,
+                examples_ru_source TEXT,
                 synonyms_ru      TEXT,
                 antonyms_ru      TEXT,
                 related_words_ru TEXT,
@@ -228,6 +256,10 @@ def ensure_vocab_final_table(db_path):
             )
             """
         )
+        # 既存DB（CREATE TABLE IF NOT EXISTSでは列追加されない）向けのマイグレーション
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(vocab_final)")}
+        if "examples_ru_source" not in existing_cols:
+            conn.execute("ALTER TABLE vocab_final ADD COLUMN examples_ru_source TEXT")
         conn.commit()
 
 
@@ -258,10 +290,10 @@ def save_vocab_to_cache(db_path, word, source_hash, ru, generated, provider, mod
             """
             INSERT INTO vocab_final (
                 word, source_hash, pos, gender, aspect, paired_verb, accent,
-                meaning_ja, memory_tip_ja, examples_ru, examples_ja,
+                meaning_ja, memory_tip_ja, examples_ru, examples_ja, examples_ru_source,
                 synonyms_ru, antonyms_ru, related_words_ru,
                 provider, model, raw_llm_output, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(word, source_hash) DO UPDATE SET
                 pos = excluded.pos,
                 gender = excluded.gender,
@@ -272,6 +304,7 @@ def save_vocab_to_cache(db_path, word, source_hash, ru, generated, provider, mod
                 memory_tip_ja = excluded.memory_tip_ja,
                 examples_ru = excluded.examples_ru,
                 examples_ja = excluded.examples_ja,
+                examples_ru_source = excluded.examples_ru_source,
                 synonyms_ru = excluded.synonyms_ru,
                 antonyms_ru = excluded.antonyms_ru,
                 related_words_ru = excluded.related_words_ru,
@@ -284,7 +317,7 @@ def save_vocab_to_cache(db_path, word, source_hash, ru, generated, provider, mod
                 word, source_hash, generated["POS"], generated["Gender"],
                 generated["Aspect"], generated["PairedVerb"], ru["accent"],
                 generated["Meaning_JA"], generated["MemoryTip_JA"],
-                ru["examples_ru"], generated["Examples_JA"],
+                generated["Examples_RU"], generated["Examples_JA"], ru["examples_ru"],
                 ru["synonyms_ru"], ru["antonyms_ru"], ru["related_words_ru"],
                 provider, model, raw_output, now_iso(),
             ),
@@ -332,8 +365,6 @@ def call_llm_api(word: str, ru: dict, provider_cfg: dict) -> tuple[dict, str]:
     max_retries = max(1, provider_cfg.get("max_retries", 3))
     timeout = provider_cfg.get("timeout_seconds", 60)
 
-    ru_example_count = len([t for t in ru["examples_ru"].split(ITEM_SEP) if t.strip()])
-
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -346,12 +377,20 @@ def call_llm_api(word: str, ru: dict, provider_cfg: dict) -> tuple[dict, str]:
                 if key not in parsed or not isinstance(parsed[key], str):
                     raise ValueError(f"LLM応答に必須キー '{key}'（文字列）が含まれていません")
 
-            # 例文の項目数（" / "区切り）がロシア語原文と一致しない場合は、
-            # 対応関係が崩れている（訳の欠落・混入）疑いがあるため生成失敗として扱う
-            ja_example_count = len([t for t in parsed["Examples_JA"].split(ITEM_SEP) if t.strip()])
-            if ru_example_count and ru_example_count != ja_example_count:
+            # プロンプトの指示（空項目・末尾区切り禁止）だけに頼らず、決定的に正規化する
+            for key in ("Meaning_JA", "Examples_RU", "Examples_JA"):
+                parsed[key] = _normalize_joined(parsed[key])
+
+            # 例文は今回LLMが新規生成するため、比較対象はスクレイピング原文ではなく
+            # 生成したExamples_RUとExamples_JA同士。対応関係が崩れている（訳の欠落・混入）
+            # 疑いがある場合は生成失敗として扱う
+            generated_ru_count = len([t for t in parsed["Examples_RU"].split(ITEM_SEP) if t.strip()])
+            generated_ja_count = len([t for t in parsed["Examples_JA"].split(ITEM_SEP) if t.strip()])
+            if generated_ru_count == 0:
+                raise ValueError("Examples_RUが生成されていません")
+            if generated_ru_count != generated_ja_count:
                 raise ValueError(
-                    f"例文の項目数が不一致（RU={ru_example_count}, JA={ja_example_count}）"
+                    f"生成された例文の項目数が不一致（RU={generated_ru_count}, JA={generated_ja_count}）"
                 )
 
             return parsed, content
@@ -425,6 +464,7 @@ def row_to_csv_dict(row):
         "MemoryTip_JA": row["memory_tip_ja"] or "",
         "Examples_RU": row["examples_ru"] or "",
         "Examples_JA": row["examples_ja"] or "",
+        "Examples_RU_Source": row["examples_ru_source"] or "",
         "Synonyms_RU": row["synonyms_ru"] or "",
         "Antonyms_RU": row["antonyms_ru"] or "",
         "RelatedWords_RU": row["related_words_ru"] or "",
