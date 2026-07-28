@@ -1,7 +1,7 @@
 """
 common.py
 ---------
-全モジュール（scraping.py / summarize.py / formatter.py / main.py）で共有する
+全モジュール（scraping.py / create_vocab.py）で共有する
 設定読み込み・DB接続・ロギングのユーティリティ。
 """
 
@@ -27,33 +27,12 @@ _db_initialized = False
 # ---------------------------------------------------------------------------
 # 設定読み込み
 # ---------------------------------------------------------------------------
-def _resolve_env_placeholder(raw: str) -> str:
-    """"${VAR:-default}" 形式の環境変数参照を解決する"""
-    if isinstance(raw, str) and raw.startswith("${") and raw.endswith("}") and ":-" in raw:
-        inner = raw[2:-1]
-        var_name, default_val = inner.split(":-", 1)
-        return os.environ.get(var_name, default_val)
-    return raw
-
-
 def load_config(path: str = CONFIG_PATH) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    # 環境変数プレースホルダの解決
-    if "llm" in config and "base_url" in config["llm"]:
-        config["llm"]["base_url"] = _resolve_env_placeholder(config["llm"]["base_url"]).rstrip("/")
-
-    if "polish_llm" in config and "base_url" in config["polish_llm"]:
-        config["polish_llm"]["base_url"] = _resolve_env_placeholder(config["polish_llm"]["base_url"]).rstrip("/")
-
     # デフォルト値の補完
     config.setdefault("database", {}).setdefault("path", "dictionary.db")
-    llm = config.setdefault("llm", {})
-    llm.setdefault("temperature", 0.0)
-    llm.setdefault("max_tokens", 1024)
-    llm.setdefault("timeout_seconds", 120)
-    llm.setdefault("max_retries", 2)
 
     scraping = config.setdefault("scraping", {})
     scraping.setdefault("sources", [])
