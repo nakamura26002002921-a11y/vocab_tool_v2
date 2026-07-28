@@ -34,7 +34,7 @@ import sys
 import time
 from typing import Optional
 
-import requests
+from curl_cffi import requests
 
 from common import ensure_db_initialized, get_connection, load_config, now_iso, setup_logger
 
@@ -69,7 +69,7 @@ def _fetch_html_page(url: str, user_agent: str, timeout: int, max_retries: int) 
 
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp = requests.get(url, headers=headers, timeout=timeout, impersonate="chrome120")
             if resp.status_code == 404:
                 raise ScrapingError(f"404 Not Found: {url}")
             resp.raise_for_status()
