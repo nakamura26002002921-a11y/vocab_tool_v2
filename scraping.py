@@ -27,14 +27,16 @@ scraping.py
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import sys
 import time
 from typing import Optional
 
 import requests
 
-from common import get_connection, now_iso, setup_logger
+from common import ensure_db_initialized, get_connection, load_config, now_iso, setup_logger
 
 logger = setup_logger("logs/errors.log")
 
@@ -394,6 +396,8 @@ def apply_field_extractors(wikitext: str, field_map: dict) -> dict:
       "etymology"              - Этимология節の平文
       "synonyms_list"          - Синонимы節の箇条書き
       "collocation_list"       - Фразеологизмы/Синонимы節の箇条書き（用途に応じ節名を変更可）
+      "list:<セクション名>"     - 任意のセクション名を指定して箇条書きを拾う汎用指定子
+                                  （例: "list:Антонимы" で対義語、"list:Родственные слова" で派生語）
     """
     sections = _split_sections(wikitext)
     meaning_body = _extract_meaning_section(sections) or ""
@@ -521,9 +525,11 @@ def _save_to_cache(db_path: str, word: str, result: dict, save_raw_html: bool = 
         conn.commit()
 
 
-def scrape_word(word: str, config: dict) -> dict:
+def scrape_word(word: str, config: dict, force_refresh: bool = False) -> dict:
     """指定単語について config.scraping.sources に列挙された全ソースを処理する。
     各ソースはキャッシュがあれば再利用し、なければ取得してキャッシュに保存する。
+    force_refresh=True の場合はキャッシュを無視して必ず再取得する
+    （field_map を変更した後、既存キャッシュに新フィールドを反映させたい場合等に使用）。
 
     戻り値: {
         "word": word,
@@ -540,7 +546,7 @@ def scrape_word(word: str, config: dict) -> dict:
     results = {}
     for source in sources:
         url = _build_url(source["url_template"], word)
-        cached = _load_from_cache(db_path, word, url)
+        cached = None if force_refresh else _load_from_cache(db_path, word, url)
 
         if cached is not None:
             logger.info("scraping: cache hit word=%s source=%s", word, source["name"])
@@ -562,44 +568,57 @@ def scrape_word(word: str, config: dict) -> dict:
     return {"word": word, "sources": results}
 
 
-import argparse
-import json
-import sys
-# 必要な他のインポートはそのままにしてください
-from common import ensure_db_initialized, load_config
-
+# ---------------------------------------------------------------------------
+# エントリーポイント
+# ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="単語リストをスクレイピングするツール")
+    parser = argparse.ArgumentParser(description="単語リストをスクレイピングし、raw_dataテーブルに保存するツール")
     parser.add_argument("--startidx", type=int, default=1, help="開始行 (1始まり)")
     parser.add_argument("--endidx", type=int, default=100, help="終了行")
     parser.add_argument("--input", type=str, default="words.txt", help="入力ファイル名")
-    
+    parser.add_argument(
+        "--force", action="store_true",
+        help="既存キャッシュ(raw_data)を無視して必ず再取得する"
+             "（config.jsonのfield_mapを変更した後、新フィールドを反映させたい場合等に使用）",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="各単語の抽出結果JSONを標準出力に表示しない（進捗行のみ表示）",
+    )
     args = parser.parse_args()
 
-    # 設定読み込み・DB初期化
     cfg = load_config()
     ensure_db_initialized(cfg["database"]["path"])
 
-    # ファイルの読み込みと範囲の抽出
     try:
         with open(args.input, "r", encoding="utf-8") as f:
-            # 1始まりのインデックスをリストのインデックスに合わせるため調整
-            lines = [line.strip() for line in f.readlines()]
-            target_words = lines[args.startidx - 1 : args.endidx]
+            words = [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
         print(f"エラー: {args.input} が見つかりません。")
         sys.exit(1)
 
-    # 処理実行
-    results = []
-    for word in target_words:
-        if not word: continue
-        print(f"Scraping: {word}")
-        data = scrape_word(word, cfg)
-        results.append(data)
+    start = max(0, args.startidx - 1)
+    end = min(len(words), args.endidx)
+    target_words = words[start:end]
 
-    # 結果出力
-    print(json.dumps(results, ensure_ascii=False, indent=2))
+    if args.force:
+        print("--force 指定: 既存キャッシュを無視して全単語を再取得します。")
+
+    results = []
+    for i, word in enumerate(target_words, start=start + 1):
+        print(f"[{i}/{len(words)}] Scraping: {word}")
+        try:
+            data = scrape_word(word, cfg, force_refresh=args.force)
+        except ScrapingError as e:
+            print(f"  -> エラー: {e}")
+            logger.warning("scraping: word=%s error=%s", word, e)
+            continue
+        results.append(data)
+        if not args.quiet:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+
+    print(f"完了: {len(results)}/{len(target_words)}件を処理しました。")
+
 
 if __name__ == "__main__":
     main()
