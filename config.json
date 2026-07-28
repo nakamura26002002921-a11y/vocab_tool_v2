@@ -1,0 +1,131 @@
+{
+  "database": {
+    "path": "dictionary.db"
+  },
+  "llm": {
+    "model": "hf.co/VlSav/Vikhr-Nemo-12B-Instruct-R-21-09-24-Q8_0-GGUF:Q8_0",
+    "base_url": "${OLLAMA_BASE_URL:-http://localhost:11434}",
+    "temperature": 0.0,
+    "max_tokens": 1536,
+    "timeout_seconds": 240,
+    "max_retries": 2
+  },
+  "polish_llm": {
+    "model": "qwen3:14b",
+    "base_url": "${OLLAMA_BASE_URL:-http://localhost:11434}",
+    "temperature": 0.0,
+    "max_tokens": 1536,
+    "timeout_seconds": 240,
+    "max_retries": 2
+  },
+  "scraping": {
+    "sources": [
+      {
+        "name": "ru_wiktionary",
+        "source_type": "mediawiki_wikitext",
+        "url_template": "https://ru.wiktionary.org/wiki/{word}",
+        "api_url_template": "https://ru.wiktionary.org/w/api.php",
+        "enabled": true,
+        "field_map": {
+          "pos_block": "pos_block",
+          "meaning_list": "meaning_definitions",
+          "example_list": "examples",
+          "accent_word": "accent_word",
+          "collocation_list": "list:Фразеологизмы",
+          "synonyms": "list:Синонимы",
+          "antonyms": "list:Антонимы",
+          "related_words": "list:Родственные слова",
+          "etymology": "etymology"
+        },
+        "timeout_seconds": 15,
+        "max_retries": 2,
+        "request_delay_seconds": 1.0
+      },
+      {
+        "name": "multitran",
+        "source_type": "html",
+        "url_template": "https://www.multitran.com/m.exe?s={word}&l1=2&l2=9",
+        "enabled": true,
+        "field_map": {
+          "translations": [
+            "<td[^>]*class=\"[^\"]*subj[^\"]*\"[^>]*>.*?</td>\\s*<td[^>]*>\\s*(?:<a[^>]*>)?([^<]+)(?:</a>)?",
+            "<a[^>]*href=\"[^\"]*m\\.exe\\?[^\"]*\"[^>]*>([^<]+)</a>"
+          ],
+          "subject_areas": [
+            "<td[^>]*class=\"[^\"]*subj[^\"]*\"[^>]*>\\s*(?:<[^>]*>)*\\s*([^<]+?)\\s*(?:<[^>]*>)*\\s*</td>"
+          ]
+        },
+        "timeout_seconds": 15,
+        "max_retries": 2,
+        "request_delay_seconds": 1.5,
+        "note": "実際のHTML構造は未確認のため推定パターン。動作結果を見て field_map の正規表現を調整すること。"
+      },
+      {
+        "name": "reverso_context",
+        "source_type": "html",
+        "url_template": "https://context.reverso.net/translation/russian-english/{word}",
+        "enabled": true,
+        "field_map": {
+          "translations": [
+            "<a[^>]*class=\"[^\"]*translation[^\"]*\"[^>]*>\\s*<span[^>]*>([^<]+)</span>",
+            "<div[^>]*id=\"translations-content\"[^>]*>.*?<a[^>]*>([^<]+)</a>"
+          ],
+          "example_pairs_source": [
+            "<div[^>]*class=\"[^\"]*src[^\"]* ltr\"[^>]*>\\s*<span[^>]*class=\"text\"[^>]*>(.*?)</span>"
+          ],
+          "example_pairs_target": [
+            "<div[^>]*class=\"[^\"]*trg[^\"]* ltr\"[^>]*>\\s*<span[^>]*class=\"text\"[^>]*>(.*?)</span>"
+          ]
+        },
+        "timeout_seconds": 20,
+        "max_retries": 2,
+        "request_delay_seconds": 1.5,
+        "note": "SPA寄りのサイトのためSSR HTMLに翻訳データが含まれない場合がある。動作結果を見てfield_mapを調整、または __NEXT_DATA__ 等の埋め込みJSON抽出方式への切り替えが必要になる可能性あり。"
+      }
+    ],
+    "user_agent": "Mozilla/5.0 (compatible; VocabToolBot/1.0; +https://example.com/bot-info)"
+  },
+  "pipeline": {
+    "max_workers": 4,
+    "on_error": "keep_as_error_row",
+    "input_file": "words.txt",
+    "output_file": "vocab.csv",
+    "csv_bom": true,
+    "log_file": "logs/errors.log"
+  },
+  "vocab_llm": {
+    "provider": "groq",
+    "providers": {
+      "groq": {
+        "api_key": "YOUR_GROQ_API_KEY",
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+        "temperature": 0.2,
+        "max_tokens": 2048,
+        "timeout_seconds": 60,
+        "max_retries": 3,
+        "request_delay_seconds": 0.5
+      },
+      "gemini": {
+        "api_key": "YOUR_GEMINI_API_KEY",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "model": "gemini-2.5-flash",
+        "temperature": 0.2,
+        "max_tokens": 2048,
+        "timeout_seconds": 60,
+        "max_retries": 3,
+        "request_delay_seconds": 0.5
+      },
+      "openrouter": {
+        "api_key": "YOUR_OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "temperature": 0.2,
+        "max_tokens": 2048,
+        "timeout_seconds": 60,
+        "max_retries": 3,
+        "request_delay_seconds": 2.0
+      }
+    }
+  }
+}
