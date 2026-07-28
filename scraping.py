@@ -157,10 +157,18 @@ _DEF_LINE_RE = re.compile(r"^#\s*(.+)$", re.MULTILINE)
 _LIST_LINE_RE = re.compile(r"^[*#]\s*(.+)$", re.MULTILINE)
 
 
+# {{этимология:слово|...}} のような語源テンプレートは、中身を丸ごと消すと
+# 「Происходит от」のような前置きの文言だけが残ってしまう。テンプレート名の
+# 後ろの「:слово」部分（語源となる語）だけを残す。
+_ETYMOLOGY_TEMPLATE_RE = re.compile(r"\{\{этимология:([^|}]*)[^}]*\}\}")
+
+
 def _strip_wiki_markup(text: str) -> str:
     """wikitext断片から装飾記法を取り除き、プレーンテキストに近づける。"""
     # {{выдел|слово}} のような強調テンプレートは中身だけ残す
     text = re.sub(r"\{\{выдел\|([^}]*)\}\}", r"\1", text)
+    # {{этимология:слово|...}} は語源となる語だけ残す（空なら丸ごと除去）
+    text = _ETYMOLOGY_TEMPLATE_RE.sub(lambda m: m.group(1).strip(), text)
     # 未処理のテンプレートは丸ごと除去（{{семантика|...}} 等のメタ情報テンプレート）
     text = _TEMPLATE_RE.sub("", text)
     # 内部リンクは表示テキストのみ残す
@@ -170,6 +178,7 @@ def _strip_wiki_markup(text: str) -> str:
     # 参照タグなど残った不要マークアップを軽く除去
     text = re.sub(r"<ref[^>]*/?>.*?(</ref>)?", "", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
 
 
@@ -269,9 +278,49 @@ def _extract_list_items(body: str) -> list[str]:
     return results
 
 
+# 品詞節の先頭テンプレート（{{сущ-ru|...}} {{сущ ru f 3a|...}} {{прил ru 1a/b|...}}
+# {{adv ru|...}} {{гл ru|...}} 等）は、実際のページでは「テンプレート名の直後の
+# 名前付きでない最初の引数」がアクセント付き見出し語であることが多い。ただし全ての
+# 品詞テンプレートで先頭引数が見出し語とは限らない（{{сущ ru f ina 3a|основа=...}}
+# のように名前付き引数から始まるケースもある）ため、まず先頭引数を見て、それが
+# 「имя=знач」形式でなければアクセント語とみなし、そうでなければ本文中の最初の
+# アクセント記号（\u0301結合文字）を含む語を拾うフォールバックを使う。
+_POS_TEMPLATE_RE = re.compile(
+    r"\{\{((?:сущ|прил|adv|гл|мест|числ|нареч|межд|предл|союз)[^|}]*)\|"
+)
+# {{слоги|сце́/на}} や {{по-слогам|на|ско́ль|ко}} のように、音節区切りテンプレートの
+# 引数を連結すればアクセント付きの完全な語形が復元できる。
+_SYLLABLE_TEMPLATE_RE = re.compile(r"\{\{(?:слоги|по-слогам)\|([^}]*)\}\}")
+_ACCENT_CHAR = "\u0301"
+
+
+def _pos_template_headword(body: str) -> Optional[str]:
+    """品詞節冒頭のテンプレートから、アクセント付き見出し語を取り出す。
+    まず先頭テンプレートの最初の位置引数（名前なし）を試し、無ければ
+    音節区切りテンプレート（слоги/по-слогам）の引数を連結して復元する。"""
+    m = _POS_TEMPLATE_RE.search(body)
+    if m:
+        # テンプレート名の直後から次の | または } までを最初の引数として取り出す
+        rest = body[m.end():]
+        first_arg = rest.split("|", 1)[0].split("}}", 1)[0].strip()
+        if first_arg and "=" not in first_arg and "{" not in first_arg:
+            return first_arg
+    # 先頭引数が名前付き（例: основа=..., вопр=1）の場合、音節テンプレートから復元
+    m2 = _SYLLABLE_TEMPLATE_RE.search(body)
+    if m2:
+        syllables = re.split(r"[/|]", m2.group(1))
+        # 「.」は旧字体との境界などを示す区切り記号であり、語形の一部ではないので除く
+        word = "".join(s.strip().replace(".", "") for s in syllables if s.strip())
+        if word:
+            return word
+    return None
+
+
 def _extract_pos_block(sections: list[dict]) -> list[str]:
-    """「Морфологические и синтаксические свойства」節の本文（品詞テンプレート＋
-    アクセント付き見出し行）から、テンプレートを除いたプレーンテキスト段落を返す。"""
+    """「Морфологические и синтаксические свойства」節から、品詞テンプレート名
+    （品詞ラベル）とアクセント付き見出し語を抽出する。この節は通常テンプレート
+    呼び出しのみで構成され、地の文の段落は存在しないため、テンプレート自体から
+    情報を取り出す。"""
     body = _find_section_body(
         sections,
         "Морфологические и синтаксические свойства",
@@ -280,9 +329,17 @@ def _extract_pos_block(sections: list[dict]) -> list[str]:
     )
     if not body:
         return []
-    # 空行区切りで段落化し、テンプレート除去後に残る自然文のみ拾う
-    paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
     results = []
+    m = _POS_TEMPLATE_RE.search(body)
+    if m:
+        results.append(m.group(1).strip())
+    headword = _pos_template_headword(body)
+    if headword:
+        results.append(headword)
+    if results:
+        return results
+    # フォールバック：テンプレート除去後に自然文が残っていればそれを拾う
+    paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
     for p in paragraphs:
         cleaned = _strip_wiki_markup(p)
         if cleaned:
@@ -291,12 +348,17 @@ def _extract_pos_block(sections: list[dict]) -> list[str]:
 
 
 def _extract_accent_word(sections: list[dict]) -> list[str]:
-    """品詞節の中の「'''слово́'''」のような太字強調（アクセント付き見出し語）を抽出する。"""
+    """品詞節冒頭のテンプレート引数、またはページ本文中のアクセント付き語形
+    （'''強調'''ではなく、実際にはテンプレート引数として現れることが多い）を抽出する。"""
     body = _find_section_body(
         sections,
         "Морфологические и синтаксические свойства",
         "Морфологические",
     )
+    if body:
+        headword = _pos_template_headword(body)
+        if headword:
+            return [headword]
     if not body:
         return []
     results = []
