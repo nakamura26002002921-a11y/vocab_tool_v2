@@ -1,0 +1,13 @@
+# vocab_tool_v2 の実行に必要なPythonパッケージ
+#
+# 構成: scraping.py -> create_vocab.py の2段階パイプライン
+# （ローカルLLM/Ollamaは使用しない。外部LLM API呼び出しはrequestsで直接行う）
+#
+# 備考:
+# - scraping.py はHTML/Wikitextの抽出を正規表現で行っており、
+#   BeautifulSoup等のHTMLパーサは使用していません。
+# - create_vocab.py はOpenAI互換の /chat/completions エンドポイント
+#   （Groq / Gemini / OpenRouter）をrequestsで直接叩くため、
+#   各社公式SDKも不要です。
+
+requests>=2.31.0
