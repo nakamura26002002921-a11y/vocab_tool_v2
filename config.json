@@ -2,22 +2,6 @@
   "database": {
     "path": "dictionary.db"
   },
-  "llm": {
-    "model": "hf.co/VlSav/Vikhr-Nemo-12B-Instruct-R-21-09-24-Q8_0-GGUF:Q8_0",
-    "base_url": "${OLLAMA_BASE_URL:-http://localhost:11434}",
-    "temperature": 0.0,
-    "max_tokens": 1536,
-    "timeout_seconds": 240,
-    "max_retries": 2
-  },
-  "polish_llm": {
-    "model": "qwen3:14b",
-    "base_url": "${OLLAMA_BASE_URL:-http://localhost:11434}",
-    "temperature": 0.0,
-    "max_tokens": 1536,
-    "timeout_seconds": 240,
-    "max_retries": 2
-  },
   "scraping": {
     "sources": [
       {
