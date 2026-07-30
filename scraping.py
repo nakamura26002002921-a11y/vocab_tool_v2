@@ -199,8 +199,10 @@ def _fetch_wikitext(api_url: str, page: str, user_agent: str, timeout: int, max_
 # ---------------------------------------------------------------------------
 # wikitext パーサ
 # ---------------------------------------------------------------------------
-# 見出し行: == .. == / === .. === / ==== .. ==== など（レベル1〜6）
-_HEADING_RE = re.compile(r"^(={2,6})\s*(.+?)\s*\1\s*$", re.MULTILINE)
+# 見出し行: = .. = / == .. == / === .. === など（レベル1〜6）。
+# ru.wiktionary.org の言語見出しは "= {{-ru-}} =" のようにレベル1（=1個）で
+# 書かれることがあるため、{1,6} として最上位レベルも対象に含める。
+_HEADING_RE = re.compile(r"^(={1,6})\s*(.+?)\s*\1\s*$", re.MULTILINE)
 
 # テンプレート呼び出し {{...}}（入れ子1階層まで対応。ru.wiktionaryのテンプレートは
 # 稀に {{выдел|...}} のような入れ子を含むため、非貪欲マッチで最短一致を狙う）
@@ -244,50 +246,82 @@ def _strip_wiki_markup(text: str) -> str:
     return text.strip()
 
 
-# 「Русский」単独、または同綴異義語（語源が複数あり別ブロックに分かれている場合）向けの
-# "Русский I" / "Русский II" / "Русский 1" / "Русский (2)" のような表記に一致させる。
-# 前方一致にすることで「Белорусский」等（"русский"を含むが別言語の名称）を除外しつつ、
-# ローマ数字・算用数字・括弧付き連番のバリエーションを許容する。
-_RUSSIAN_HEADING_RE = re.compile(r"^русский(\s*\(?\s*[ivxlc0-9]*\s*\)?)?\.?$")
+# ru.wiktionary.org の言語見出しは、レンダリング後のHTMLでは「Русский」という表示
+# テキストになるが、生のwikitextでは "= {{-ru-}} =" のように {{-ru-}} という言語
+# テンプレート呼び出しで書かれている（レベルもページによって "=" 1個〜複数のことがある）。
+# "{{-chu-ru-}}"（教会スラブ語からロシア語への移行期を表す言語コード）のように
+# "ru" を含むが別言語を指すテンプレートもあるため、"{{-」〜「-}}」の中身全体を
+# 言語コードとして取り出し、厳密に "ru" と一致するかを見る。
+_LANG_TEMPLATE_HEADING_RE = re.compile(r"^\{\{-([a-z0-9]+(?:-[a-z0-9]+)*)-\}\}$")
+
+# 稀なケース（過去のリビジョンや手動編集等）で、テンプレートではなく直接
+# "Русский" とテキストで書かれている場合のフォールバック用パターン。
+# 同綴異義語で "Русский I" / "Русский II" / "Русский 1" のように連番が付く
+# ことがあるため、前方一致で許容する。
+_RUSSIAN_TEXT_HEADING_RE = re.compile(r"^русский(\s*\(?\s*[ivxlc0-9]*\s*\)?)?\.?$")
+
+
+def _heading_language_code(title: str) -> Optional[str]:
+    """見出しタイトルが "{{-xx-}}" 形式の言語テンプレートであれば言語コード
+    （xx部分）を返す。そうでなければ None。"""
+    m = _LANG_TEMPLATE_HEADING_RE.match(title.strip())
+    return m.group(1) if m else None
 
 
 def _is_russian_heading(title: str) -> bool:
+    """見出しが現代ロシア語セクションを表すかどうかを判定する。
+
+    実際のwikitextでは言語見出しは "{{-ru-}}" テンプレートで書かれているため、
+    まずテンプレートとして解釈し、言語コードが厳密に "ru" と一致するかを見る
+    （"{{-chu-ru-}}" 等、"ru" を含む別言語コードを誤って拾わないため）。
+    テンプレートでない場合は、直接 "Русский" と書かれているケースにも
+    フォールバックで対応する。"""
+    code = _heading_language_code(title)
+    if code is not None:
+        return code == "ru"
     normalized = title.strip().lower()
-    return bool(_RUSSIAN_HEADING_RE.match(normalized))
+    return bool(_RUSSIAN_TEXT_HEADING_RE.match(normalized))
 
 
 def _extract_russian_block(wikitext: str) -> str:
-    """レベル2見出し（言語区分）でページを分割し、「Русский」ブロックのみを返す。
+    """見出し（レベルは問わない）でページを分割し、「ロシア語」に該当する
+    ブロックのみを返す。
 
     ru.wiktionary.org のページは同じ綴りの単語が複数言語（Украинский, Белорусский,
     Болгарский, Казахский 等）に渡って併記されることがあり、各言語ブロックが
     "Морфологические и синтаксические свойства" "Значение" "Синонимы" 等、
-    ロシア語ブロックと同名の見出しを持つため、ブロックを絞らずに処理すると
+    ロシア語ブロックと同名の子見出しを持つため、ブロックを絞らずに処理すると
     他言語の情報を誤って抽出してしまう。
 
     また、есть・малый 等の同綴異義語（語源が複数あり意味的に無関係）は、
-    "Русский" 単独ではなく "Русский I" / "Русский II" のように語源ごとに
-    別のレベル2見出しへ分割されていることがあるため、該当する見出しを
-    すべて拾い、本文を連結して返す（取りこぼしを防ぐため）。
+    "{{-ru-}}" 言語見出しがページ内に複数回現れることがあるため、該当する
+    見出しをすべて拾い、本文を連結して返す（取りこぼしを防ぐため）。
 
-    見出し名の判定は "русский" への前方一致（大小文字・空白・連番表記の
-    ゆれを無視）で行う。"Белорусский" 等、"русский" を含むが別言語を指す
-    紛らわしい見出しは前方一致条件により除外される。"""
-    level2 = [m for m in _HEADING_RE.finditer(wikitext) if len(m.group(1)) == 2]
+    各言語見出しの本文の範囲は、その見出し自身のレベル以下（同階層または
+    それより上位）の次の見出しが現れるまでとする（見出しレベルがページに
+    よって "=" 1個だったり複数だったりするため、レベル番号を決め打ちしない）。
+    """
+    headings = list(_HEADING_RE.finditer(wikitext))
 
-    if not level2:
-        # レベル2見出しが無ければ単一言語ページ（＝ロシア語のみ）とみなしそのまま返す
+    if not headings:
+        # 見出しが1つも無ければ単一言語ページ（＝ロシア語のみ）とみなしそのまま返す
         return wikitext
 
     blocks = []
-    for i, m in enumerate(level2):
+    for i, m in enumerate(headings):
         title = m.group(2).strip()
-        if _is_russian_heading(title):
-            start = m.end()
-            end = level2[i + 1].start() if i + 1 < len(level2) else len(wikitext)
-            blocks.append(wikitext[start:end])
+        if not _is_russian_heading(title):
+            continue
+        level = len(m.group(1))
+        start = m.end()
+        end = len(wikitext)
+        for other in headings[i + 1:]:
+            if len(other.group(1)) <= level:
+                end = other.start()
+                break
+        blocks.append(wikitext[start:end])
 
-    # 「Русский」系ブロックが1つも見つからなければ空文字（=何も抽出しない）
+    # ロシア語ブロックが1つも見つからなければ空文字（=何も抽出しない）
     return "\n\n".join(blocks) if blocks else ""
 
 
