@@ -401,20 +401,19 @@ def call_llm_api(word: str, ru: dict, provider_cfg: dict) -> tuple[dict, str]:
 # ---------------------------------------------------------------------------
 # オーケストレーション
 # ---------------------------------------------------------------------------
-def get_provider_config(cfg):
+def get_provider_config(cfg, override_api_key=None):
     vocab_llm_cfg = cfg["vocab_llm"]
     provider_name = vocab_llm_cfg["provider"]
     providers = vocab_llm_cfg.get("providers", {})
     if provider_name not in providers:
-        raise KeyError(
-            f"vocab_llm.provider='{provider_name}' が vocab_llm.providers に定義されていません。"
-            f" 定義済み: {list(providers.keys())}"
-        )
+        raise KeyError(...)
     provider_cfg = providers[provider_name]
+
+    if override_api_key:
+        provider_cfg["api_key"] = override_api_key
+
     if not provider_cfg.get("api_key") or provider_cfg["api_key"].startswith("YOUR_"):
-        raise ValueError(
-            f"vocab_llm.providers.{provider_name}.api_key が未設定です。config.json に実際のAPIキーを設定してください。"
-        )
+        raise ValueError(...)
     return provider_name, provider_cfg
 
 
@@ -487,6 +486,8 @@ def main():
         "--provider", type=str, default=None,
         help="使用するAPIプロバイダ名（groq/gemini/openrouter等）。省略時は config.json の vocab_llm.provider",
     )
+    parser.add_argument("--api-key", type=str, default=None, help="LLM APIキー（config.jsonより優先）")
+  
     args = parser.parse_args()
 
     cfg = load_config()
@@ -496,7 +497,7 @@ def main():
 
     if args.provider:
         cfg["vocab_llm"]["provider"] = args.provider
-    provider_name, provider_cfg = get_provider_config(cfg)
+    provider_name, provider_cfg = get_provider_config(cfg, override_api_key=args.api_key)
     delay = provider_cfg.get("request_delay_seconds", 0.5)
 
     output_file = args.output or cfg["pipeline"]["output_file"]
