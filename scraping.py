@@ -244,6 +244,35 @@ def _strip_wiki_markup(text: str) -> str:
     return text.strip()
 
 
+def _extract_russian_block(wikitext: str) -> str:
+    """レベル2見出し（言語区分）でページを分割し、「Русский」ブロックのみを返す。
+
+    ru.wiktionary.org のページは同じ綴りの単語が複数言語（Украинский, Белорусский,
+    Болгарский, Казахский 等）に渡って併記されることがあり、各言語ブロックが
+    "Морфологические и синтаксические свойства" "Значение" "Синонимы" 等、
+    ロシア語ブロックと同名の見出しを持つため、ブロックを絞らずに処理すると
+    他言語の情報を誤って抽出してしまう。
+
+    見出し名は完全一致（大小文字は無視、前後空白は無視）で判定する
+    （"Белорусский" 等、部分一致だと "русский" を含む紛らわしい言語名を
+    誤って拾う恐れがあるため）。"""
+    level2 = [m for m in _HEADING_RE.finditer(wikitext) if len(m.group(1)) == 2]
+
+    if not level2:
+        # レベル2見出しが無ければ単一言語ページ（＝ロシア語のみ）とみなしそのまま返す
+        return wikitext
+
+    for i, m in enumerate(level2):
+        title = m.group(2).strip()
+        if title.lower() == "русский":
+            start = m.end()
+            end = level2[i + 1].start() if i + 1 < len(level2) else len(wikitext)
+            return wikitext[start:end]
+
+    # 「Русский」ブロックが見つからなければ空文字（=何も抽出しない）
+    return ""
+
+
 def _split_sections(wikitext: str) -> list[dict]:
     """wikitextを見出し単位で分割する。
     戻り値: [{"level": int, "title": str, "body": str}, ...]
@@ -512,6 +541,11 @@ def apply_field_extractors(wikitext: str, field_map: dict) -> dict:
     """field_map（config.jsonのfield_map、キー=フィールド名、値=抽出種別）に従って
     wikitextから各フィールドを抽出する。
 
+    処理の最初に _extract_russian_block() で「Русский」レベル2セクションのみに
+    範囲を絞り込む。ru.wiktionary.org のページは同一綴りの単語が複数言語
+    （Украинский, Белорусский等）に渡って併記され、各言語ブロックが同名の
+    子見出しを持つため、これを行わないと他言語の情報を誤って抽出してしまう。
+
     field_map の値は以下のいずれかの識別子文字列:
       "meaning_definitions"  - Значение節の # 定義行
       "examples"              - {{пример|...}} の本文
@@ -523,7 +557,8 @@ def apply_field_extractors(wikitext: str, field_map: dict) -> dict:
       "list:<セクション名>"     - 任意のセクション名を指定して箇条書きを拾う汎用指定子
                                   （例: "list:Антонимы" で対義語、"list:Родственные слова" で派生語）
     """
-    sections = _split_sections(wikitext)
+    russian_wikitext = _extract_russian_block(wikitext)
+    sections = _split_sections(russian_wikitext)
     meaning_body = _extract_meaning_section(sections) or ""
 
     extracted: dict = {}
@@ -532,9 +567,10 @@ def apply_field_extractors(wikitext: str, field_map: dict) -> dict:
             if extractor_id == "meaning_definitions":
                 extracted[field_name] = _extract_definitions(meaning_body)
             elif extractor_id == "examples":
-                # 例文は Значение節配下だけでなくページ全体から拾う
-                # （複数語義にまたがる {{пример}} を取りこぼさないため）
-                extracted[field_name] = _extract_examples(wikitext)
+                # 例文は Значение節配下だけでなくロシア語ブロック全体から拾う
+                # （複数語義にまたがる {{пример}} を取りこぼさないため。ただし
+                # _extract_russian_block により他言語ブロックは既に除外済み）
+                extracted[field_name] = _extract_examples(russian_wikitext)
             elif extractor_id == "pos_block":
                 extracted[field_name] = _extract_pos_block(sections)
             elif extractor_id == "accent_word":
@@ -561,6 +597,10 @@ def scrape_source(word: str, source: dict, user_agent: str) -> dict:
     source["source_type"] が "mediawiki_wikitext" ならwikitext方式、
     それ以外（未指定含む）ならHTML方式で処理する。
 
+    wikitext方式の場合、ページに「Русский」レベル2セクションが存在しない
+    （＝その単語のロシア語での見出しが無い＝他言語のみの同綴りページ）場合は
+    status="not_found" として扱う。
+
     戻り値: {"source_url": str, "status": "ok"|"not_found"|"error",
              "extracted": dict, "raw_html": str|None, "error": str|None}
     """
@@ -577,6 +617,16 @@ def scrape_source(word: str, source: dict, user_agent: str) -> dict:
             status = "not_found" if "404" in str(e) else "error"
             logger.info("scraping: word=%s source=%s status=%s (%s)", word, source["name"], status, e)
             return {"source_url": url, "status": status, "extracted": {}, "raw_html": None, "error": str(e)}
+
+        if not _extract_russian_block(raw_content):
+            logger.info(
+                "scraping: word=%s source=%s status=not_found (no Русский section)",
+                word, source["name"],
+            )
+            return {
+                "source_url": url, "status": "not_found", "extracted": {},
+                "raw_html": raw_content, "error": "Русский section not found",
+            }
 
         try:
             extracted = apply_field_extractors(raw_content, source.get("field_map", {}))
