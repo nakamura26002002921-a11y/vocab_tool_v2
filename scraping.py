@@ -244,6 +244,18 @@ def _strip_wiki_markup(text: str) -> str:
     return text.strip()
 
 
+# 「Русский」単独、または同綴異義語（語源が複数あり別ブロックに分かれている場合）向けの
+# "Русский I" / "Русский II" / "Русский 1" / "Русский (2)" のような表記に一致させる。
+# 前方一致にすることで「Белорусский」等（"русский"を含むが別言語の名称）を除外しつつ、
+# ローマ数字・算用数字・括弧付き連番のバリエーションを許容する。
+_RUSSIAN_HEADING_RE = re.compile(r"^русский(\s*\(?\s*[ivxlc0-9]*\s*\)?)?\.?$")
+
+
+def _is_russian_heading(title: str) -> bool:
+    normalized = title.strip().lower()
+    return bool(_RUSSIAN_HEADING_RE.match(normalized))
+
+
 def _extract_russian_block(wikitext: str) -> str:
     """レベル2見出し（言語区分）でページを分割し、「Русский」ブロックのみを返す。
 
@@ -253,24 +265,30 @@ def _extract_russian_block(wikitext: str) -> str:
     ロシア語ブロックと同名の見出しを持つため、ブロックを絞らずに処理すると
     他言語の情報を誤って抽出してしまう。
 
-    見出し名は完全一致（大小文字は無視、前後空白は無視）で判定する
-    （"Белорусский" 等、部分一致だと "русский" を含む紛らわしい言語名を
-    誤って拾う恐れがあるため）。"""
+    また、есть・малый 等の同綴異義語（語源が複数あり意味的に無関係）は、
+    "Русский" 単独ではなく "Русский I" / "Русский II" のように語源ごとに
+    別のレベル2見出しへ分割されていることがあるため、該当する見出しを
+    すべて拾い、本文を連結して返す（取りこぼしを防ぐため）。
+
+    見出し名の判定は "русский" への前方一致（大小文字・空白・連番表記の
+    ゆれを無視）で行う。"Белорусский" 等、"русский" を含むが別言語を指す
+    紛らわしい見出しは前方一致条件により除外される。"""
     level2 = [m for m in _HEADING_RE.finditer(wikitext) if len(m.group(1)) == 2]
 
     if not level2:
         # レベル2見出しが無ければ単一言語ページ（＝ロシア語のみ）とみなしそのまま返す
         return wikitext
 
+    blocks = []
     for i, m in enumerate(level2):
         title = m.group(2).strip()
-        if title.lower() == "русский":
+        if _is_russian_heading(title):
             start = m.end()
             end = level2[i + 1].start() if i + 1 < len(level2) else len(wikitext)
-            return wikitext[start:end]
+            blocks.append(wikitext[start:end])
 
-    # 「Русский」ブロックが見つからなければ空文字（=何も抽出しない）
-    return ""
+    # 「Русский」系ブロックが1つも見つからなければ空文字（=何も抽出しない）
+    return "\n\n".join(blocks) if blocks else ""
 
 
 def _split_sections(wikitext: str) -> list[dict]:
