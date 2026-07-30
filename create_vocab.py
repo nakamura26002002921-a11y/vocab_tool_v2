@@ -27,6 +27,14 @@ raw_data の生テキスト（wikitextから軽くクリーニングしただけ
   その単語の生成全体を失敗として扱う（中途半端な対応関係のデータをDB/CSVに
   混入させないためのフェイルセーフ）。
 
+【プロンプト短縮について（このバージョンでの変更点）】
+- SYSTEM_PROMPTを簡潔な英語に圧縮し、トークン数を削減した。
+- USER_PROMPTは、raw_dataに値が入っているフィールドのみを動的に組み立てて渡す
+  （build_user_prompt）。値が空のフィールド（例: 動詞のGenderが該当しない、
+  コロケーション情報が無い、等）はそもそもプロンプトに含めないため、
+  従来の「空欄を"-"で埋めて全項目を毎回送る」方式より入力トークンを大きく削減できる。
+  結果に影響する情報（事実データそのもの）は一切削っていない。
+
 出力項目:
   ロシア語単語, アクセント, 品詞, 意味(日本語解説), 覚え方・コロケーション(日本語解説),
   例文(ロシア語), 例文訳(日本語), 類義語(ロシア語), 対義語(ロシア語),
@@ -134,102 +142,80 @@ def get_ru_source_data(db_path: str, word: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# LLM用プロンプト
+# LLM用プロンプト（短縮版）
 # ---------------------------------------------------------------------------
+# 元のSYSTEM_PROMPTは詳細な英語説明が長く、入力トークンを圧迫していたため簡潔化。
+# 意味的な指示内容（ハルシネーション禁止・多義語対応・新規例文作成の方針など）は保持している。
 SYSTEM_PROMPT = (
-    "You are an expert Russian-language teacher creating a vocabulary flashcard for a "
-    "Japanese learner of Russian, to be studied in a spaced-repetition app. You will be "
-    "given raw data scraped from Russian Wiktionary for a single word: a paragraph "
-    "describing its grammatical properties (part of speech, gender, aspect, aspectual "
-    "pair, etc.), its natural, hand-picked meaning definitions, some existing example "
-    "sentences (these are real citations from a Russian corpus — reliable but often in "
-    "a literary/formal register), and lists of synonyms/antonyms/related words. This "
-    "Russian material is reliable and idiomatic, though the grammar paragraph is "
-    "unstructured free text that you must parse yourself, and the existing example "
-    "sentences may be sparse, missing, or stylistically dated for a learner. Optionally "
-    "you may also receive short English translations from other dictionaries as extra "
-    "reference (these can be noisy or incomplete; trust the Russian material first). "
-    "Your job is three-fold: "
-    "(1) parse the grammar paragraph to identify part of speech, gender (nouns only), "
-    "aspect (verbs only), and the aspectual pair verb (verbs only) — leave a field "
-    "empty if it does not apply or is not stated; "
-    "(2) write, in Japanese, a concise dictionary card based on the Russian material: "
-    "the meaning and a memory tip / mnemonic / common collocations; "
-    "(3) instead of translating the existing example sentences, WRITE YOUR OWN new, "
-    "natural, contemporary Russian example sentences — at most two, covering the most "
-    "representative meaning sense(s) from Meaning_JA (if the word is polysemous, pick "
-    "the one or two most important/common senses rather than covering every sense) — "
-    "plus their Japanese translations. Each generated example "
-    "must clearly illustrate one of the meaning senses you identified; do not invent a "
-    "meaning or usage that is not supported by the given Russian material (definitions, "
-    "existing examples, or collocations). Prefer everyday, natural phrasing a modern "
-    "native speaker would actually say over rare vocabulary or ornate literary "
-    "constructions, while staying grammatically correct and idiomatic. You may use the "
-    "existing example sentences as inspiration/reference but should not reuse them "
-    "verbatim. "
-    "Pay close attention to idioms, colloquial phrasing, and polysemous meanings so "
-    "your Japanese reflects the true intended meaning rather than a literal "
-    "word-for-word translation. Do not invent grammatical facts or meanings not "
-    "supported by the given Russian material. Output valid JSON only, with no "
-    "markdown code fences. Never include empty items or trailing ' / ' separators in "
-    "any of the ' / '-joined string fields."
+    "Russian teacher making a Japanese-learner vocab flashcard from Russian Wiktionary data. "
+    "Input: unstructured grammar text, RU meaning definitions, existing RU example "
+    "sentences (reliable but sometimes formal/dated - reference only, don't just "
+    "translate them), collocations, synonyms/antonyms/related words, optional noisy "
+    "English glosses from other dictionaries. "
+    "Tasks: "
+    "(1) Parse grammar text -> POS, gender (nouns only), aspect + aspectual pair verb "
+    "(verbs only); leave empty if not applicable/stated. "
+    "(2) Write in Japanese: meaning explanation + memory tip/mnemonic/common "
+    "collocations, based only on the given Russian material. "
+    "(3) Write NEW natural, contemporary Russian example sentences (max 2, covering "
+    "the 1-2 most representative meaning senses, not every sense) plus their Japanese "
+    "translations. May use existing examples as inspiration but do not reuse verbatim. "
+    "Do not invent meanings, usages, or grammar facts not supported by the given "
+    "material. Prefer natural everyday phrasing over rare/literary constructions. "
+    "Output raw JSON only, no markdown fences, no commentary. In any ' / '-joined "
+    "field, never leave empty items or a trailing ' / '."
 )
 
-USER_PROMPT_TEMPLATE = """\
-# 単語
-{word}
+# JSON出力フォーマットの指示部分。単語ごとに変わらないので定数として1回だけ定義する。
+_JSON_INSTRUCTION = """\
+上記情報のみを根拠に、日本語の単語帳カードを以下のJSON形式で出力してください（他のテキスト禁止）:
+{
+  "POS": "品詞（例: 名詞, 動詞, 形容詞）",
+  "Gender": "性（名詞のみ。例: 男性/女性/中性。該当なしは空文字）",
+  "Aspect": "体（動詞のみ。例: 完了体/不完了体。該当なしは空文字）",
+  "PairedVerb": "アスペクトペア動詞（動詞のみ、ロシア語。無ければ空文字）",
+  "Meaning_JA": "日本語の意味。複数なら「 / 」区切り、空項目・末尾区切り禁止",
+  "MemoryTip_JA": "覚え方のコツ+代表的コロケーションを日本語で簡潔に",
+  "Examples_RU": "あなたが新規作成した自然なロシア語例文（最大2文、代表的な意味のみ）、「 / 」区切り",
+  "Examples_JA": "Examples_RUと同数・同順の日本語訳、「 / 」区切り"
+}"""
 
-# 文法情報（ru.wiktionary.orgの品詞節、未整形の自然文。ここから品詞/性/体/ペア動詞を判定する）
-{pos_block_ru}
+# フィールド名 -> raw_data辞書のキー・プロンプト内ラベルの対応。
+# 値が空のフィールドはプロンプトに含めないことで入力トークンを削減する
+# （事実データを削るのではなく、単に「無い情報を送らない」だけなので生成品質への影響はない）。
+_FIELD_LABELS = [
+    ("pos_block_ru", "文法情報"),
+    ("meanings_ru", "意味定義"),
+    ("examples_ru", "既存例文(参考のみ,直訳しない)"),
+    ("collocations_ru", "コロケーション"),
+    ("etymology_ru", "語源"),
+    ("synonyms_ru", "類義語"),
+    ("antonyms_ru", "対義語"),
+    ("related_words_ru", "関連語"),
+]
 
-# ロシア語の意味定義（Wiktionaryより）
-{meanings_ru}
 
-# 既存の例文（Wiktionaryより、参考情報。実在するコーパスからの引用で内容は信頼できるが、
-# やや硬い/古い文体のことがある。そのまま訳すのではなく、意味の把握と新しい例文作成の参考にすること）
-{examples_ru}
+def build_user_prompt(word: str, ru: dict) -> str:
+    """raw_dataの中身に応じて、値が入っているフィールドだけを組み立てて
+    ユーザープロンプトを生成する（空フィールドは省略してトークンを節約）。"""
+    lines = [f"単語: {word}"]
+    for key, label in _FIELD_LABELS:
+        val = ru.get(key)
+        if val:
+            lines.append(f"{label}: {val}")
 
-# 既存のコロケーション（あれば）
-{collocations_ru}
+    en_parts = []
+    if ru.get("multitran_translations_en"):
+        en_parts.append(f"Multitran: {ru['multitran_translations_en']}")
+    if ru.get("reverso_translations_en"):
+        en_parts.append(f"Reverso: {ru['reverso_translations_en']}")
+    if en_parts:
+        lines.append("英訳(参考程度、ノイズ含む可能性あり): " + " / ".join(en_parts))
 
-# 語源（あれば、覚え方の参考に）
-{etymology_ru}
+    lines.append("")
+    lines.append(_JSON_INSTRUCTION)
+    return "\n".join(lines)
 
-# 類義語（ロシア語、参考情報）
-{synonyms_ru}
-
-# 対義語（ロシア語、参考情報）
-{antonyms_ru}
-
-# 派生語・関連語（ロシア語、参考情報）
-{related_words_ru}
-
-# 他辞書からの英訳（参考程度、ノイズを含む可能性あり）
-Multitran: {multitran_translations_en}
-Reverso Context: {reverso_translations_en}
-
-# タスク
-上記のロシア語情報を根拠にして、日本語の単語帳カードを作成してください。
-イディオムや多義語のニュアンスに注意し、直訳ではなく意図された意味を日本語で表現してください。
-文法情報は「文法情報」欄の自然文から読み取り、記載が無い項目は空文字にしてください。
-例文は「既存の例文」をそのまま訳すのではなく、Meaning_JAで挙げた意味の中から代表的な
-意味を最大2つ選び、それぞれに対応する自然で現代的な新しいロシア語例文（合計最大2文）を
-あなた自身が作成し、その日本語訳も付けてください（多義語のすべての意味に例文をつける
-必要はありません。意味を勝手に増やして例文を作らないこと。既存の例文にある用法・
-コロケーションの範囲内で自然な文を作ること）。
-
-以下のJSON形式で出力してください（他のテキストは一切含めないこと）:
-{{
-  "POS": "品詞（例: 名詞, 動詞, 形容詞 など。文法情報欄から判断）",
-  "Gender": "性（名詞の場合のみ。例: 男性, 女性, 中性。該当しなければ空文字）",
-  "Aspect": "体（動詞の場合のみ。例: 完了体, 不完了体。該当しなければ空文字）",
-  "PairedVerb": "完了体/不完了体のペア動詞（動詞の場合のみ、ロシア語表記。無ければ空文字）",
-  "Meaning_JA": "日本語での意味の解説。複数の意味がある場合は「 / 」区切りで並べる。空項目・末尾の区切りは禁止",
-  "MemoryTip_JA": "語源・イメージ・語呂合わせなどの覚え方のコツと、代表的なコロケーション（よく使われる語の組み合わせ）を日本語で簡潔に説明する",
-  "Examples_RU": "代表的な意味（最大2つ）についてあなたが新規作成した自然なロシア語例文（最大2文）。「 / 」区切りで並べる。空項目・末尾の区切りは禁止",
-  "Examples_JA": "Examples_RUと同じ数・同じ順序の日本語訳を「 / 」区切りで並べる。空項目・末尾の区切りは禁止"
-}}
-"""
 
 _REQUIRED_KEYS = ("POS", "Gender", "Aspect", "PairedVerb", "Meaning_JA", "MemoryTip_JA", "Examples_RU", "Examples_JA")
 
@@ -345,24 +331,12 @@ def call_llm_api(word: str, ru: dict, provider_cfg: dict) -> tuple[dict, str]:
     Groq・OpenRouterはネイティブ対応、GeminiもOpenAI互換パス(v1beta/openai)を使う。
     失敗時（HTTPエラー・JSONパース失敗・必須キー欠落・例文の項目数不一致）はリトライし、
     最終的に VocabGenerationError を送出する。"""
-    prompt = USER_PROMPT_TEMPLATE.format(
-        word=word,
-        pos_block_ru=ru["pos_block_ru"] or "-",
-        meanings_ru=ru["meanings_ru"] or "-",
-        examples_ru=ru["examples_ru"] or "-",
-        collocations_ru=ru["collocations_ru"] or "-",
-        etymology_ru=ru["etymology_ru"] or "-",
-        synonyms_ru=ru["synonyms_ru"] or "-",
-        antonyms_ru=ru["antonyms_ru"] or "-",
-        related_words_ru=ru["related_words_ru"] or "-",
-        multitran_translations_en=ru["multitran_translations_en"] or "-",
-        reverso_translations_en=ru["reverso_translations_en"] or "-",
-    )
+    prompt = build_user_prompt(word, ru)
 
     payload = {
         "model": provider_cfg["model"],
         "temperature": provider_cfg.get("temperature", 0.2),
-        "max_tokens": provider_cfg.get("max_tokens", 2048),
+        "max_tokens": provider_cfg.get("max_tokens", 1024),
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
