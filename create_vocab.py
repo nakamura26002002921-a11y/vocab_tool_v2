@@ -3,42 +3,17 @@ create_vocab.py
 ----------------
 scraping.py が raw_data テーブルに保存した生データ（主に ru.wiktionary.org から
 抽出したロシア語の意味・例文・品詞情報・類義語/対義語/派生語など）を直接読み込み、
-無料枠のLLM API（Groq / Google AI Studio(Gemini) / OpenRouter のいずれか、
-config.json の vocab_llm.provider で切替）を1回呼び出すだけで、
-日本語学習者向けの単語帳データを生成し、CSVとDB（vocab_final テーブル）に保存する。
-
-【中間のLLM構造化ステージ（旧 summarize.py）は存在しない】
-以前のバージョンでは、ロシア語の生データをローカルLLM(Ollama)でいったん
-品詞/性/体/意味/例文などに構造化する summarize.py を挟んでいたが、
-本バージョンでは廃止した。Groq/Gemini等の外部API側のモデルは十分に高性能なため、
-raw_data の生テキスト（wikitextから軽くクリーニングしただけの品詞節・語義節・
-例文など）をそのままプロンプトに渡し、1回のAPI呼び出しで
-  (a) 品詞・性・体・ペア動詞などの文法情報の抽出
-  (b) 日本語での意味・覚え方の解説の生成
-  (c) 例文の日本語訳
-をまとめて行わせる。
+LLM API（Ollama等のOpenAI互換エンドポイント。config.json の vocab_llm.provider で切替）を
+1回呼び出すだけで、日本語学習者向けの単語帳データを生成し、CSVとDB（vocab_final テーブル）に保存する。
 
 【ハルシネーション対策】
-- 意味・品詞情報の"事実"に関わる部分（例文原文・類義語・対義語・派生語・アクセント）は
-  raw_data からそのまま決定的に転記し、LLMには生成させない。
+- 例文原文・類義語・対義語・派生語・アクセントは raw_data からそのまま決定的に転記し、
+  LLMには生成させない。
 - LLMに生成させるのは「日本語での説明・翻訳」という言語表現部分のみに限定する。
-- 例文の日本語訳(Examples_JA)は、原文(Examples_RU)と同じ数・同じ順序の
-  " / "区切り項目になるようプロンプトで指示し、項目数が一致しない場合は
-  その単語の生成全体を失敗として扱う（中途半端な対応関係のデータをDB/CSVに
-  混入させないためのフェイルセーフ）。
-
-【プロンプト短縮について（このバージョンでの変更点）】
-- SYSTEM_PROMPTを簡潔な英語に圧縮し、トークン数を削減した。
-- USER_PROMPTは、raw_dataに値が入っているフィールドのみを動的に組み立てて渡す
-  （build_user_prompt）。値が空のフィールド（例: 動詞のGenderが該当しない、
-  コロケーション情報が無い、等）はそもそもプロンプトに含めないため、
-  従来の「空欄を"-"で埋めて全項目を毎回送る」方式より入力トークンを大きく削減できる。
-  結果に影響する情報（事実データそのもの）は一切削っていない。
-
-出力項目:
-  ロシア語単語, アクセント, 品詞, 意味(日本語解説), 覚え方・コロケーション(日本語解説),
-  例文(ロシア語), 例文訳(日本語), 類義語(ロシア語), 対義語(ロシア語),
-  派生語・アスペクトペア(ロシア語)
+- Meaning_JAは単語帳の選択肢として使うため、最大3項目まで決定的に切り詰める
+  （各項目の文字数はLLMへの指示のみに委ね、コード側での文字カットはしない）。
+- Examples_JAはExamples_RUと同じ数・同じ順序の" / "区切り項目になるようプロンプトで
+  指示し、項目数が一致しない場合はその単語の生成全体を失敗として扱う。
 
 使い方:
   python3 create_vocab.py --startidx 1 --endidx 10 --output vocab.csv
@@ -63,6 +38,9 @@ CSV_HEADER = [
     "Examples_RU", "Examples_JA", "Examples_RU_Source",
     "Synonyms_RU", "Antonyms_RU", "RelatedWords_RU",
 ]
+
+MAX_MEANING_ITEMS = 3
+MAX_EXAMPLES = 2
 
 
 class VocabGenerationError(Exception):
@@ -91,15 +69,13 @@ def _get_raw_extracted(db_path: str, word: str, source_url_substr: str) -> dict 
 
 
 def _normalize_joined(s: str) -> str:
-    """" / "区切り文字列から、空項目・前後の余分な空白を除去して再結合する。
-    プロンプト遵守（空項目/末尾区切り禁止の指示）だけに頼らず、決定的に保証するためのフェイルセーフ。"""
+    """" / "区切り文字列から、空項目・前後の余分な空白を除去して再結合する。"""
     if not isinstance(s, str):
         return s
     return ITEM_SEP.join(t.strip() for t in s.split(ITEM_SEP) if t.strip())
 
 
 # Wiktionaryが「該当データなし/不明」を表すために使うプレースホルダー記号。
-# これらのみで構成される項目は情報を持たないため、_join_items で除去する。
 _PLACEHOLDER_TOKENS = {"—", "–", "-", "?", "#", "??", "###"}
 
 
@@ -116,8 +92,7 @@ def _join_items(items) -> str:
 
 def get_ru_source_data(db_path: str, word: str) -> dict | None:
     """raw_data から、ロシア語の一次情報（ru_wiktionary）と、補助的な参考情報
-    （multitran / reverso_context の英訳、あれば）をまとめて取得する。
-    ru_wiktionary のデータが無ければ単語帳カードを作れないため None を返す。"""
+    （multitran / reverso_context の英訳、あれば）をまとめて取得する。"""
     wiktionary = _get_raw_extracted(db_path, word, "wiktionary")
     if wiktionary is None:
         return None
@@ -135,7 +110,6 @@ def get_ru_source_data(db_path: str, word: str) -> dict | None:
         "antonyms_ru": _join_items(wiktionary.get("antonyms")),
         "related_words_ru": _join_items(wiktionary.get("related_words")),
         "etymology_ru": _join_items(wiktionary.get("etymology")),
-        # 補助的な参考情報（英訳）。無ければ空文字のまま、プロンプトには「参考程度」として渡す。
         "multitran_translations_en": _join_items(multitran.get("translations")),
         "reverso_translations_en": _join_items(reverso.get("translations")),
     }
@@ -144,45 +118,35 @@ def get_ru_source_data(db_path: str, word: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # LLM用プロンプト（短縮版）
 # ---------------------------------------------------------------------------
-# 元のSYSTEM_PROMPTは詳細な英語説明が長く、入力トークンを圧迫していたため簡潔化。
-# 意味的な指示内容（ハルシネーション禁止・多義語対応・新規例文作成の方針など）は保持している。
 SYSTEM_PROMPT = (
-    "Russian teacher making a Japanese-learner vocab flashcard from Russian Wiktionary data. "
-    "Input: unstructured grammar text, RU meaning definitions, existing RU example "
-    "sentences (reliable but sometimes formal/dated - reference only, don't just "
-    "translate them), collocations, synonyms/antonyms/related words, optional noisy "
-    "English glosses from other dictionaries. "
+    "Russian teacher making Japanese vocab flashcards from Wiktionary data. "
+    "Input: grammar text, RU meaning defs, existing RU examples (reference only, "
+    "don't translate verbatim), collocations, synonyms/antonyms/related words, "
+    "optional noisy EN glosses. "
     "Tasks: "
-    "(1) Parse grammar text -> POS, gender (nouns only), aspect + aspectual pair verb "
-    "(verbs only); leave empty if not applicable/stated. "
-    "(2) Write in Japanese: meaning explanation + memory tip/mnemonic/common "
-    "collocations, based only on the given Russian material. "
-    "(3) Write NEW natural, contemporary Russian example sentences (max 2, covering "
-    "the 1-2 most representative meaning senses, not every sense) plus their Japanese "
-    "translations. May use existing examples as inspiration but do not reuse verbatim. "
-    "Do not invent meanings, usages, or grammar facts not supported by the given "
-    "material. Prefer natural everyday phrasing over rare/literary constructions. "
-    "Output raw JSON only, no markdown fences, no commentary. In any ' / '-joined "
-    "field, never leave empty items or a trailing ' / '."
+    "(1) POS, gender (nouns), aspect+paired verb (verbs); empty if N/A. "
+    "(2) Meaning_JA: up to 3 short JA gloss words (~10 chars each, dictionary-"
+    "headword style, NOT sentences), most common senses first. "
+    "MemoryTip_JA: JA mnemonic + common collocations. "
+    "(3) Write 2 NEW natural modern RU example sentences (main senses only, not "
+    "verbatim from input) + JA translations. "
+    "No invented meanings/grammar beyond given material. Output raw JSON only, "
+    "no fences/commentary. In ' / '-joined fields: no empty items, no trailing ' / '."
 )
 
-# JSON出力フォーマットの指示部分。単語ごとに変わらないので定数として1回だけ定義する。
 _JSON_INSTRUCTION = """\
-上記情報のみを根拠に、日本語の単語帳カードを以下のJSON形式で出力してください（他のテキスト禁止）:
+JSON形式のみで出力（他のテキスト禁止）:
 {
-  "POS": "品詞（例: 名詞, 動詞, 形容詞）",
-  "Gender": "性（名詞のみ。例: 男性/女性/中性。該当なしは空文字）",
-  "Aspect": "体（動詞のみ。例: 完了体/不完了体。該当なしは空文字）",
-  "PairedVerb": "アスペクトペア動詞（動詞のみ、ロシア語。無ければ空文字）",
-  "Meaning_JA": "日本語の意味。複数なら「 / 」区切り、空項目・末尾区切り禁止",
-  "MemoryTip_JA": "覚え方のコツ+代表的コロケーションを日本語で簡潔に",
-  "Examples_RU": "あなたが新規作成した自然なロシア語例文（最大2文、代表的な意味のみ）、「 / 」区切り",
-  "Examples_JA": "Examples_RUと同数・同順の日本語訳、「 / 」区切り"
+  "POS": "品詞", "Gender": "性(名詞のみ)", "Aspect": "体(動詞のみ)",
+  "PairedVerb": "ペア動詞(動詞のみ)",
+  "Meaning_JA": "短い訳語、最大3項目、各10字程度、「 / 」区切り",
+  "MemoryTip_JA": "覚え方+コロケーション(日本語)",
+  "Examples_RU": "新規ロシア語例文(最大2文)、「 / 」区切り",
+  "Examples_JA": "Examples_RUと同数同順の日本語訳、「 / 」区切り"
 }"""
 
 # フィールド名 -> raw_data辞書のキー・プロンプト内ラベルの対応。
-# 値が空のフィールドはプロンプトに含めないことで入力トークンを削減する
-# （事実データを削るのではなく、単に「無い情報を送らない」だけなので生成品質への影響はない）。
+# 値が空のフィールドはプロンプトに含めないことで入力トークンを削減する。
 _FIELD_LABELS = [
     ("pos_block_ru", "文法情報"),
     ("meanings_ru", "意味定義"),
@@ -254,7 +218,6 @@ def ensure_vocab_final_table(db_path):
             )
             """
         )
-        # 既存DB（CREATE TABLE IF NOT EXISTSでは列追加されない）向けのマイグレーション
         existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(vocab_final)")}
         if "examples_ru_source" not in existing_cols:
             conn.execute("ALTER TABLE vocab_final ADD COLUMN examples_ru_source TEXT")
@@ -324,11 +287,10 @@ def save_vocab_to_cache(db_path, word, source_hash, ru, generated, provider, mod
 
 
 # ---------------------------------------------------------------------------
-# LLM API呼び出し（OpenAI互換 /chat/completions 形式。Groq / Gemini / OpenRouter 共通）
+# LLM API呼び出し（OpenAI互換 /chat/completions 形式。Ollama等）
 # ---------------------------------------------------------------------------
 def call_llm_api(word: str, ru: dict, provider_cfg: dict) -> tuple[dict, str]:
     """OpenAI互換の /chat/completions エンドポイントを叩き、JSONをパースして返す。
-    Groq・OpenRouterはネイティブ対応、GeminiもOpenAI互換パス(v1beta/openai)を使う。
     失敗時（HTTPエラー・JSONパース失敗・必須キー欠落・例文の項目数不一致）はリトライし、
     最終的に VocabGenerationError を送出する。"""
     prompt = build_user_prompt(word, ru)
@@ -367,23 +329,22 @@ def call_llm_api(word: str, ru: dict, provider_cfg: dict) -> tuple[dict, str]:
             for key in ("Meaning_JA", "Examples_RU", "Examples_JA"):
                 parsed[key] = _normalize_joined(parsed[key])
 
-            # 例文は最大2件までという指示も、プロンプト遵守だけに頼らず決定的に切り詰める
-            MAX_EXAMPLES = 2
+            # Meaning_JAは単語帳の選択肢として使うため項目数だけ決定的に制限する
+            # （字数はプロンプトの指示("~10字程度")のみに委ね、文字列カットはしない）
+            meaning_items = [t for t in parsed["Meaning_JA"].split(ITEM_SEP) if t]
+            parsed["Meaning_JA"] = ITEM_SEP.join(meaning_items[:MAX_MEANING_ITEMS])
+
+            # 例文も最大2件までという指示を、プロンプト遵守だけに頼らず決定的に切り詰める
             for key in ("Examples_RU", "Examples_JA"):
-                items = [t for t in parsed[key].split(ITEM_SEP) if t.strip()]
+                items = [t for t in parsed[key].split(ITEM_SEP) if t]
                 parsed[key] = ITEM_SEP.join(items[:MAX_EXAMPLES])
 
-            # 例文は今回LLMが新規生成するため、比較対象はスクレイピング原文ではなく
-            # 生成したExamples_RUとExamples_JA同士。対応関係が崩れている（訳の欠落・混入）
-            # 疑いがある場合は生成失敗として扱う
-            generated_ru_count = len([t for t in parsed["Examples_RU"].split(ITEM_SEP) if t.strip()])
-            generated_ja_count = len([t for t in parsed["Examples_JA"].split(ITEM_SEP) if t.strip()])
-            if generated_ru_count == 0:
+            ru_count = len([t for t in parsed["Examples_RU"].split(ITEM_SEP) if t])
+            ja_count = len([t for t in parsed["Examples_JA"].split(ITEM_SEP) if t])
+            if ru_count == 0:
                 raise ValueError("Examples_RUが生成されていません")
-            if generated_ru_count != generated_ja_count:
-                raise ValueError(
-                    f"生成された例文の項目数が不一致（RU={generated_ru_count}, JA={generated_ja_count}）"
-                )
+            if ru_count != ja_count:
+                raise ValueError(f"例文の項目数が不一致（RU={ru_count}, JA={ja_count}）")
 
             return parsed, content
         except Exception as e:  # noqa: BLE001
@@ -406,14 +367,14 @@ def get_provider_config(cfg, override_api_key=None):
     provider_name = vocab_llm_cfg["provider"]
     providers = vocab_llm_cfg.get("providers", {})
     if provider_name not in providers:
-        raise KeyError(...)
+        raise KeyError(f"config.jsonにプロバイダ '{provider_name}' の設定がありません")
     provider_cfg = providers[provider_name]
 
     if override_api_key:
         provider_cfg["api_key"] = override_api_key
 
-    if not provider_cfg.get("api_key") or provider_cfg["api_key"].startswith("YOUR_"):
-        raise ValueError(...)
+    if not provider_cfg.get("api_key"):
+        raise ValueError(f"プロバイダ '{provider_name}' の api_key が設定されていません")
     return provider_name, provider_cfg
 
 
@@ -475,7 +436,7 @@ def write_csv(rows, output_file, use_bom=True):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="raw_data(scraping.pyの取得結果)から、外部LLM API(Groq/Gemini/OpenRouter)を使って"
+        description="raw_data(scraping.pyの取得結果)から、LLM API(Ollama等)を使って"
                     "日本語の単語帳データを直接生成し、CSVとDB(vocab_final)に保存するツール"
     )
     parser.add_argument("--startidx", type=int, default=1, help="開始行 (1始まり)")
@@ -484,10 +445,10 @@ def main():
     parser.add_argument("--output", type=str, default=None, help="出力CSVファイル名（省略時は config.json の設定値）")
     parser.add_argument(
         "--provider", type=str, default=None,
-        help="使用するAPIプロバイダ名（groq/gemini/openrouter等）。省略時は config.json の vocab_llm.provider",
+        help="使用するAPIプロバイダ名（ollama等）。省略時は config.json の vocab_llm.provider",
     )
     parser.add_argument("--api-key", type=str, default=None, help="LLM APIキー（config.jsonより優先）")
-  
+
     args = parser.parse_args()
 
     cfg = load_config()
