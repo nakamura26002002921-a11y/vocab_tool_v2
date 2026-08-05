@@ -221,6 +221,40 @@ def ensure_vocab_final_table(db_path):
         existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(vocab_final)")}
         if "examples_ru_source" not in existing_cols:
             conn.execute("ALTER TABLE vocab_final ADD COLUMN examples_ru_source TEXT")
+
+        # 複数プロセス並列実行時、同じ単語をLLMに二重処理させないための予約テーブル。
+        # INSERT OR IGNORE がSQLiteのUNIQUE制約でアトミックに競合を防ぐ。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vocab_in_progress (
+                word         TEXT NOT NULL,
+                source_hash  TEXT NOT NULL,
+                started_at   TEXT NOT NULL,
+                PRIMARY KEY (word, source_hash)
+            )
+            """
+        )
+        conn.commit()
+
+
+def try_acquire_lock(db_path, word, source_hash) -> bool:
+    """他プロセスがまだ処理していなければ予約行を挿入してTrueを返す。
+    既に他プロセスが処理中（行が既に存在）ならFalseを返す。"""
+    with get_connection(db_path) as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO vocab_in_progress (word, source_hash, started_at) VALUES (?, ?, ?)",
+            (word, source_hash, now_iso()),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def release_lock(db_path, word, source_hash):
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "DELETE FROM vocab_in_progress WHERE word = ? AND source_hash = ?",
+            (word, source_hash),
+        )
         conn.commit()
 
 
@@ -389,15 +423,26 @@ def build_vocab_entry(word, db_path, provider_name, provider_cfg, delay=0.5):
     if cached is not None:
         return cached, None
 
-    try:
-        generated, raw_output = call_llm_api(word, ru, provider_cfg)
-    except VocabGenerationError as e:
-        return None, str(e)
+    # 他プロセスが同じ単語を処理中なら、LLM呼び出しをせずスキップする
+    if not try_acquire_lock(db_path, word, source_hash):
+        return None, "他プロセスが処理中のためスキップ"
 
-    save_vocab_to_cache(
-        db_path, word, source_hash, ru, generated,
-        provider=provider_name, model=provider_cfg["model"], raw_output=raw_output,
-    )
+    try:
+        try:
+            generated, raw_output = call_llm_api(word, ru, provider_cfg)
+        except VocabGenerationError as e:
+            return None, str(e)
+
+        save_vocab_to_cache(
+            db_path, word, source_hash, ru, generated,
+            provider=provider_name, model=provider_cfg["model"], raw_output=raw_output,
+        )
+    finally:
+        # ロックはLLM呼び出し+保存が終わり次第すぐ解放する。
+        # delay(APIレート制限用の待機)はロック保持と無関係なので、解放後に行う
+        # ＝他プロセスは自分の待機を待たされず、次の単語の処理に進める。
+        release_lock(db_path, word, source_hash)
+
     time.sleep(delay)
 
     row = load_vocab_from_cache(db_path, word, source_hash)
