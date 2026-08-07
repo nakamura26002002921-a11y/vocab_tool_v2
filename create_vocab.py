@@ -1,22 +1,9 @@
 """
 create_vocab.py
 ----------------
-scraping.py が raw_data テーブルに保存した生データ（主に ru.wiktionary.org から
-抽出したロシア語の意味・例文・品詞情報・類義語/対義語/派生語など）を直接読み込み、
-LLM API（Ollama等のOpenAI互換エンドポイント。config.json の vocab_llm.provider で切替）を
-1回呼び出すだけで、日本語学習者向けの単語帳データを生成し、CSVとDB（vocab_final テーブル）に保存する。
-
-【ハルシネーション対策】
-- 例文原文・類義語・対義語・派生語・アクセントは raw_data からそのまま決定的に転記し、
-  LLMには生成させない。
-- LLMに生成させるのは「日本語での説明・翻訳」という言語表現部分のみに限定する。
-- Meaning_JAは単語帳の選択肢として使うため、最大3項目まで決定的に切り詰める
-  （各項目の文字数はLLMへの指示のみに委ね、コード側での文字カットはしない）。
-- Examples_JAはExamples_RUと同じ数・同じ順序の" / "区切り項目になるようプロンプトで
-  指示し、項目数が一致しない場合はその単語の生成全体を失敗として扱う。
-
 使い方:
   python3 create_vocab.py --startidx 1 --endidx 10 --output vocab.csv
+  python3 create_vocab.py --startidx 1 --endidx 10 --force   # 既存データを無視して再生成・上書き
 """
 
 import argparse
@@ -412,18 +399,26 @@ def get_provider_config(cfg, override_api_key=None):
     return provider_name, provider_cfg
 
 
-def build_vocab_entry(word, db_path, provider_name, provider_cfg, delay=0.5):
+def build_vocab_entry(word, db_path, provider_name, provider_cfg, delay=0.5, force=False):
+    """単語帳エントリを1件生成する。
+
+    force=True の場合、vocab_final の既存キャッシュがあっても無視して常にLLMを
+    再呼び出しし、結果を同じ(word, source_hash)キーに上書き保存する
+    （save_vocab_to_cache は ON CONFLICT DO UPDATE なので上書きになる）。
+    """
     ru = get_ru_source_data(db_path, word)
     if ru is None:
         return None, "raw_data(ru_wiktionary)にデータが無いためスキップ（先にscraping.pyを実行してください）"
 
     source_hash = compute_source_hash(ru)
 
-    cached = load_vocab_from_cache(db_path, word, source_hash)
-    if cached is not None:
-        return cached, None
+    if not force:
+        cached = load_vocab_from_cache(db_path, word, source_hash)
+        if cached is not None:
+            return cached, None
 
     # 他プロセスが同じ単語を処理中なら、LLM呼び出しをせずスキップする
+    # （--force時も、二重にAPIを叩かないよう同じロックを使う）
     if not try_acquire_lock(db_path, word, source_hash):
         return None, "他プロセスが処理中のためスキップ"
 
@@ -493,6 +488,10 @@ def main():
         help="使用するAPIプロバイダ名（ollama等）。省略時は config.json の vocab_llm.provider",
     )
     parser.add_argument("--api-key", type=str, default=None, help="LLM APIキー（config.jsonより優先）")
+    parser.add_argument(
+        "--force", action="store_true",
+        help="vocab_finalに既存データがあっても無視し、常にLLMを再呼び出しして上書き保存する",
+    )
 
     args = parser.parse_args()
 
@@ -509,7 +508,8 @@ def main():
     output_file = args.output or cfg["pipeline"]["output_file"]
     use_bom = cfg["pipeline"]["csv_bom"]
 
-    print(f"単語帳生成モード: provider={provider_name}, model={provider_cfg['model']}")
+    mode_note = "（--force: 既存データを無視して再生成）" if args.force else ""
+    print(f"単語帳生成モード: provider={provider_name}, model={provider_cfg['model']} {mode_note}")
 
     with open(args.input, "r", encoding="utf-8") as f:
         words = [line.strip() for line in f if line.strip()]
@@ -521,7 +521,9 @@ def main():
     rows = []
     for i, word in enumerate(target_words, start=start + 1):
         print(f"[{i}/{len(words)}] 処理中: {word}")
-        row, error = build_vocab_entry(word, db_path, provider_name, provider_cfg, delay=delay)
+        row, error = build_vocab_entry(
+            word, db_path, provider_name, provider_cfg, delay=delay, force=args.force,
+        )
         if error:
             print(f"  -> スキップ: {error}")
             logger.warning("create_vocab: word=%s error=%s", word, error)
