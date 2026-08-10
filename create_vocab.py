@@ -108,13 +108,21 @@ def get_ru_source_data(db_path: str, word: str) -> dict | None:
 SYSTEM_PROMPT = (
     "Russian teacher making Japanese vocab flashcards from Wiktionary data. "
     "Input: grammar text, RU meaning defs, existing RU examples (reference only, "
-    "don't translate verbatim), collocations, synonyms/antonyms/related words, "
-    "optional noisy EN glosses. "
+    "don't translate verbatim), collocations, etymology, synonyms/antonyms/related "
+    "words, optional noisy EN glosses. "
     "Tasks: "
     "(1) POS, gender (nouns), aspect+paired verb (verbs); empty if N/A. "
     "(2) Meaning_JA: up to 3 short JA gloss words (~10 chars each, dictionary-"
     "headword style, NOT sentences), most common senses first. "
-    "MemoryTip_JA: JA mnemonic + common collocations. "
+    "MemoryTip_JA: STRICT FORMAT, two parts only, joined by ' / ':\n"
+    "  - Etymology part: summarize ONLY the given etymology_ru source in Japanese, "
+    "one short clause. Omit entirely if no etymology_ru is given. Do NOT invent "
+    "etymology, and do NOT write mnemonics, wordplay, or memory tricks of any kind.\n"
+    "  - Collocation part: up to 3 items from the given collocations_ru, each "
+    "formatted EXACTLY as <<russian phrase(japanese translation)>>, separated by "
+    "spaces. Omit entirely if no collocations_ru is given.\n"
+    "If both parts are empty, MemoryTip_JA must be an empty string \"\". "
+    "Never write anything in MemoryTip_JA other than these two parts. "
     "(3) Write 2 NEW natural modern RU example sentences (main senses only, not "
     "verbatim from input) + JA translations. "
     "No invented meanings/grammar beyond given material. Output raw JSON only, "
@@ -127,7 +135,7 @@ JSON形式のみで出力（他のテキスト禁止）:
   "POS": "品詞", "Gender": "性(名詞のみ)", "Aspect": "体(動詞のみ)",
   "PairedVerb": "ペア動詞(動詞のみ)",
   "Meaning_JA": "短い訳語、最大3項目、各10字程度、「 / 」区切り",
-  "MemoryTip_JA": "覚え方+コロケーション(日本語)",
+  "MemoryTip_JA": "語源(入力の語源情報の要約のみ。無ければ省略) / コロケーション(最大3件、各<<ロシア語(日本語訳)>>形式、無ければ省略)。両方無ければ空文字列。覚え方・語呂合わせは書かない",
   "Examples_RU": "新規ロシア語例文(最大2文)、「 / 」区切り",
   "Examples_JA": "Examples_RUと同数同順の日本語訳、「 / 」区切り"
 }"""
